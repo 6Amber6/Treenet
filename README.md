@@ -19,11 +19,19 @@
 - Standard 10-class classifier.
 
 ### 2) Parallel (2-Experts on Coarse Groups: **animal** / **vehicle**)
-- **Coarse routing** into two heads:
-  - **Animal head** (4 classes)
-  - **Vehicle head** (6 classes)
+- architecture
+  - parx :
+    - **Animal head** (4+1 classes)
+    - **Vehicle head** (6+1 classes)
+   
+  - par:
+    - **root head** (10 classes)(for binary classification)   
+    - **Animal head** (4+1 classes)
+    - **Vehicle head** (6+1 classes)
+
 - Fusion options:
   - **Independent** training + **Mixture-of-Experts (MoE)** fusion
+    - either use conf (1-pred[-1]) or prediction of root head as weight W, final logits = W_animal * animal_logits + W_vehicle * vehicle_logits
   - **Joint** training (final logits supervised) with optional auxiliary losses
   - Weighted or linear-schedule **alpha** for multi-loss
 
