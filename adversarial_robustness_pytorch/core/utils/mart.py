@@ -17,7 +17,7 @@ def mart_loss(model, x_natural, y, optimizer, step_size=0.007, epsilon=0.031, pe
     batch_size = len(x_natural)
     
     # generate adversarial example
-    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).cuda().detach()
+    x_adv = x_natural.detach() + 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
     if attack == 'linf-pgd':
         for _ in range(perturb_steps):
             x_adv.requires_grad_()
@@ -65,7 +65,7 @@ def mart_tree_loss(model, predict, tree_robust_loss, loss_fn, x_natural, y, opti
     model.eval()
     
     # generate adversarial example
-    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).cuda().detach()
+    x_adv = x_natural.detach() + 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
     if attack == 'linf-pgd':
         for _ in range(perturb_steps):
             x_adv.requires_grad_()

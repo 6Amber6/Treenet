@@ -1,0 +1,8 @@
+Using device: cpu
+Loading pre-trained sub-models...
+Model Summary:
+Total parameters: 349996
+Saving initial model weights to ./log_ce_optimization/ce_test_quick/weights-best.pt
+
+
+

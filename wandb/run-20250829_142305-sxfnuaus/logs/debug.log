@@ -1,0 +1,15 @@
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_setup.py:_flush():81] Current SDK version is 0.21.2
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_setup.py:_flush():81] Configure stats pid to 16002
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_setup.py:_flush():81] Loading settings from /Users/litong/.config/wandb/settings
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_setup.py:_flush():81] Loading settings from /Users/litong/workspace/Treenet/wandb/settings
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_init.py:setup_run_log_directory():686] Logging user logs to /Users/litong/workspace/Treenet/wandb/run-20250829_142305-sxfnuaus/logs/debug.log
+2025-08-29 14:23:05,367 INFO    MainThread:16002 [wandb_init.py:setup_run_log_directory():687] Logging internal logs to /Users/litong/workspace/Treenet/wandb/run-20250829_142305-sxfnuaus/logs/debug-internal.log
+2025-08-29 14:23:05,368 INFO    MainThread:16002 [wandb_init.py:init():813] calling init triggers
+2025-08-29 14:23:05,368 INFO    MainThread:16002 [wandb_init.py:init():818] wandb.init called with sweep_config: {}
+config: {'_wandb': {}}
+2025-08-29 14:23:05,368 INFO    MainThread:16002 [wandb_init.py:init():854] starting backend
+2025-08-29 14:23:06,003 INFO    MainThread:16002 [wandb_init.py:init():857] sending inform_init request
+2025-08-29 14:23:06,026 INFO    MainThread:16002 [wandb_init.py:init():865] backend started and connected
+2025-08-29 14:23:06,029 INFO    MainThread:16002 [wandb_init.py:init():936] updated telemetry
+2025-08-29 14:23:06,043 INFO    MainThread:16002 [wandb_init.py:init():960] communicating run to backend with 90.0 second timeout

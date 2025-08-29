@@ -36,12 +36,21 @@ def load_cifar10(data_dir, use_augmentation=False, filter_classes=None, binary_c
 
     # Apply class filtering if specified
     if filter_classes is not None:
-        train_mask = torch.isin(torch.tensor(train_dataset.targets), torch.tensor(filter_classes))
-        test_mask = torch.isin(torch.tensor(test_dataset.targets), torch.tensor(filter_classes))
+        train_targets_tensor = torch.tensor(train_dataset.targets)
+        test_targets_tensor = torch.tensor(test_dataset.targets)
+        filter_classes_tensor = torch.tensor(filter_classes)
+        
+        train_mask = torch.zeros_like(train_targets_tensor, dtype=torch.bool)
+        test_mask = torch.zeros_like(test_targets_tensor, dtype=torch.bool)
+        
+        for cls in filter_classes_tensor:
+            train_mask |= (train_targets_tensor == cls)
+            test_mask |= (test_targets_tensor == cls)
+            
         train_dataset.data = train_dataset.data[train_mask]
-        train_dataset.targets = torch.tensor(train_dataset.targets)[train_mask].tolist()
+        train_dataset.targets = train_targets_tensor[train_mask].tolist()
         test_dataset.data = test_dataset.data[test_mask]
-        test_dataset.targets = torch.tensor(test_dataset.targets)[test_mask].tolist()
+        test_dataset.targets = test_targets_tensor[test_mask].tolist()
 
         # Remap labels to a contiguous range starting from 0
         class_mapping = {old_label: new_label for new_label, old_label in enumerate(filter_classes)}
@@ -58,8 +67,20 @@ def load_cifar10(data_dir, use_augmentation=False, filter_classes=None, binary_c
     if pseudo_label_classes is not None:
         train_dataset.targets = torch.tensor(train_dataset.targets)
         test_dataset.targets = torch.tensor(test_dataset.targets)
-        train_dataset.targets[~torch.isin(train_dataset.targets, torch.tensor(pseudo_label_classes))] = 10
-        test_dataset.targets[~torch.isin(test_dataset.targets, torch.tensor(pseudo_label_classes))] = 10
+        pseudo_label_classes_tensor = torch.tensor(pseudo_label_classes)
+        
+        # Create masks for pseudo-label classes
+        train_mask = torch.zeros_like(train_dataset.targets, dtype=torch.bool)
+        test_mask = torch.zeros_like(test_dataset.targets, dtype=torch.bool)
+        
+        for cls in pseudo_label_classes_tensor:
+            train_mask |= (train_dataset.targets == cls)
+            test_mask |= (test_dataset.targets == cls)
+        
+        # Set non-pseudo-label classes to 10
+        train_dataset.targets[~train_mask] = 10
+        test_dataset.targets[~test_mask] = 10
+        
         # Remap pseudo-label classes to a contiguous range starting from 0
         class_mapping = {old_label: new_label for new_label, old_label in enumerate(pseudo_label_classes)}
         class_mapping[10] = len(pseudo_label_classes)

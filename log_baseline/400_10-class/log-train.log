@@ -1,0 +1,5 @@
+Using device: cpu
+Model Summary:
+torchsummary unavailable, skipping summary.
+Total Trainable Parameters: 175258
+======= Epoch 1 =======

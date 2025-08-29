@@ -1,4 +1,4 @@
-from core import animal_classes, vehicle_classes
+from core import animal_classes, vehicle_classes, torch_isin
 import numpy as np
 import pandas as pd
 from tqdm import tqdm as tqdm
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from core.attacks import create_attack
 from core.metrics import accuracy, binary_accuracy, subclass_accuracy
-from .model import create_model, animal_classes, vehicle_classes
+from .model import create_model
 
 from core.utils.mart import mart_loss, mart_tree_loss
 from core.utils.rst import CosineLR
@@ -72,7 +72,7 @@ class ParEnsemble(object):
 
     ):
         # default using unknown_classes flags for create_model
-        self.model = create_model(args.model, args.normalize, info, device)
+        self.model = create_model(args.model, args.normalize, info, device, unknown_classes=args.unknown_classes)
         
         self.alpha1 = alpha1
         self.alpha2 = alpha2
@@ -275,6 +275,48 @@ class ParEnsemble(object):
         """
         loss, _, _, _, _ = self.loss_fn(logits_set, y)
         return loss
+    
+    def KL_loss_fn(self, logits_adv, logits_natural, y):
+        """
+        KL divergence loss function for TRADES.
+        """
+        # For tree models, we need to handle the logits properly
+        if isinstance(logits_adv, tuple):
+            # Tree model returns tuple of logits
+            final_logits_adv = self.forward(logits_adv, logits=True)
+            final_logits_natural = self.forward(logits_natural, logits=True)
+        else:
+            # Single model returns single logits
+            final_logits_adv = logits_adv
+            final_logits_natural = logits_natural
+        
+        # KL divergence between clean and adversarial logits
+        kl_loss = F.kl_div(
+            F.log_softmax(final_logits_adv, dim=1),
+            F.softmax(final_logits_natural, dim=1),
+            reduction='batchmean'
+        )
+        return kl_loss
+    
+    def mart_loss_fn(self, adv_logits_set, logits_set, y):
+        """
+        MART loss function.
+        """
+        logits_animal, logits_vehicle = logits_set
+        adv_logits_animal, adv_logits_vehicle = adv_logits_set
+        
+        final_logits = self.forward(logits_set, logits=True)
+        adv_final_logits = self.forward(adv_logits_set, logits=True)
+        
+        # MART loss components
+        ce_loss = F.cross_entropy(adv_final_logits, y)
+        kl_loss = F.kl_div(
+            F.log_softmax(adv_final_logits, dim=1),
+            F.softmax(final_logits, dim=1),
+            reduction='batchmean'
+        )
+        
+        return ce_loss + kl_loss
 
 
     def standard_loss(self, x, y):
@@ -458,7 +500,7 @@ def map_labels_to_subroots(y, pseudo_label_classes):
     y = y.clone()
 
     # Assign pseudo-label for unknown classes
-    y[~torch.isin(y, torch.tensor(pseudo_label_classes, device=y.device))] = 10
+    y[~torch_isin(y, torch.tensor(pseudo_label_classes, device=y.device))] = 10
 
     # Remap pseudo-label classes to a contiguous range starting from 0
     class_mapping = {old_label: new_label for new_label, old_label in enumerate(pseudo_label_classes)}

@@ -1,0 +1,16 @@
+{"time":"2025-08-29T14:23:06.031254-04:00","level":"INFO","msg":"stream: starting","core version":"0.21.2"}
+{"time":"2025-08-29T14:23:06.4887-04:00","level":"INFO","msg":"stream: created new stream","id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.488756-04:00","level":"INFO","msg":"stream: started","id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.488773-04:00","level":"INFO","msg":"handler: started","stream_id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.488789-04:00","level":"INFO","msg":"writer: started","stream_id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.488781-04:00","level":"INFO","msg":"sender: started","stream_id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.559839-04:00","level":"ERROR","msg":"HTTP error","status":403,"method":"POST","url":"https://api.wandb.ai/graphql"}
+{"time":"2025-08-29T14:23:06.559921-04:00","level":"ERROR","msg":"runupserter: failed to init run","error":"returned error 403: {\"data\":{\"upsertBucket\":null},\"errors\":[{\"message\":\"permission denied\",\"path\":[\"upsertBucket\"],\"extensions\":{\"code\":\"PERMISSION_ERROR\"}}]}"}
+{"time":"2025-08-29T14:23:06.564257-04:00","level":"INFO","msg":"stream: closing","id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.564635-04:00","level":"ERROR","msg":"sender: uploadConfigFile: stream: no run"}
+{"time":"2025-08-29T14:23:06.673354-04:00","level":"ERROR","msg":"HTTP error","status":404,"method":"POST","url":"https://api.wandb.ai/graphql"}
+{"time":"2025-08-29T14:23:06.673422-04:00","level":"ERROR","msg":"runfiles: CreateRunFiles returned error: returned error 404: {\"data\":{\"createRunFiles\":null},\"errors\":[{\"message\":\"run ablation_test/sxfnuaus not found during createRunFiles\",\"path\":[\"createRunFiles\"]}]}"}
+{"time":"2025-08-29T14:23:06.673662-04:00","level":"INFO","msg":"fileTransfer: Close: file transfer manager closed"}
+{"time":"2025-08-29T14:23:06.673692-04:00","level":"INFO","msg":"handler: closed","stream_id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.673781-04:00","level":"INFO","msg":"sender: closed","stream_id":"sxfnuaus"}
+{"time":"2025-08-29T14:23:06.673798-04:00","level":"INFO","msg":"stream: closed","id":"sxfnuaus"}

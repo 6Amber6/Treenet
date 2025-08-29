@@ -27,7 +27,7 @@ def trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, 
     model.eval()
     batch_size = len(x_natural)
     # generate adversarial example
-    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).cuda().detach()
+    x_adv = x_natural.detach() + 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
     p_natural = F.softmax(model(x_natural), dim=1)
     
     if attack == 'linf-pgd':
@@ -41,7 +41,7 @@ def trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, 
             x_adv = torch.clamp(x_adv, 0.0, 1.0)
     
     elif attack == 'l2-pgd':
-        delta = 0.001 * torch.randn(x_natural.shape).cuda().detach()
+        delta = 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
         delta = Variable(delta.data, requires_grad=True)
 
         # Setup optimizers
@@ -100,7 +100,7 @@ def trades_tree_loss(model, predict, tree_KL_loss, loss_fn, x_natural, y, optimi
     batch_size = len(x_natural)
     
     # generate adversarial example
-    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).cuda().detach()
+    x_adv = x_natural.detach() + 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
     pred = model(x_natural)
     
     if attack == 'linf-pgd':
@@ -117,7 +117,7 @@ def trades_tree_loss(model, predict, tree_KL_loss, loss_fn, x_natural, y, optimi
             x_adv = torch.clamp(x_adv, 0.0, 1.0)
     
     elif attack == 'l2-pgd':
-        delta = 0.001 * torch.randn(x_natural.shape).cuda().detach()
+        delta = 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
         delta = Variable(delta.data, requires_grad=True)
 
         # Setup optimizers
