@@ -254,10 +254,10 @@ vehicle_classes = [0, 1, 8, 9]       # airplane, automobile, ship, truck
 ## Results
 
 ### Performance Comparison
-| Model | Clean Acc | Adv Acc (PGD) | Adv Acc (AutoAttack) |
-|-------|-----------|---------------|---------------------|
-| Baseline | 85.2% | 45.3% | 42.1% |
-| CE Ensemble | **87.1%** | **48.7%** | **45.2%** |
+| Model | Clean Acc | Adv Acc  | 
+|-------|-----------|---------------|
+| Baseline | 72.20% | 35.55% |
+| CE Ensemble | **76.47%** | **41.42%** |
 
 
 
