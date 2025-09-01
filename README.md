@@ -133,7 +133,7 @@ python adversarial_robustness_pytorch/train-parx.py \
   --strategy constant
 ```
 
-## 📊 Key Parameters
+## Key Parameters
 
 ### Model Parameters
 - `--model lighttreeresnet20`: Tree-structured ResNet-20
@@ -151,7 +151,7 @@ python adversarial_robustness_pytorch/train-parx.py \
 - `--alpha3 1.0`: Vehicle model loss weight
 - `--strategy constant`: Weight update strategy (constant/linear/decay)
 
-## 🔧 Advanced Configuration
+## Advanced Configuration
 
 ### Weight Update Strategies
 ```python
@@ -201,33 +201,8 @@ python adversarial_robustness_pytorch/category_group.py \
   --data cifar10
 ```
 
-## 🎛️ Optimization Strategies
 
-### 1. Weight Optimization
-```python
-# Static weights
-alpha1, alpha2, alpha3 = 0.4, 0.3, 0.3
-
-# Dynamic weights (linear decay)
-alpha2 = alpha2 * (1 - epoch/max_epochs)
-alpha3 = alpha3 * (1 - epoch/max_epochs)
-
-# Adaptive weights (based on validation performance)
-alpha2 = animal_val_acc / (animal_val_acc + vehicle_val_acc)
-alpha3 = vehicle_val_acc / (animal_val_acc + vehicle_val_acc)
-```
-
-### 2. Loss Function Enhancements
-- **Focal Loss**: Handle class imbalance
-- **KL Divergence**: Consistency between sub-models
-- **Diversity Loss**: Encourage different feature learning
-
-### 3. Training Strategy Improvements
-- **Curriculum Learning**: Progressive difficulty increase
-- **Multi-scale Attacks**: Multiple attack strengths
-- **Category-specific Augmentation**: Tailored data augmentation
-
-## 📁 Project Structure
+## Project Structure
 
 ```
 CE-optimization-solution/
@@ -248,7 +223,7 @@ CE-optimization-solution/
 └── README.md                    # This file
 ```
 
-## 🔬 Technical Details
+## Technical Details
 
 ### Confidence Calculation
 ```python
@@ -276,7 +251,7 @@ animal_classes = [2, 3, 4, 5, 6, 7]  # bird, cat, deer, dog, frog, horse
 vehicle_classes = [0, 1, 8, 9]       # airplane, automobile, ship, truck
 ```
 
-## 📊 Results
+## Results
 
 ### Performance Comparison
 | Model | Clean Acc | Adv Acc (PGD) | Adv Acc (AutoAttack) |
@@ -284,16 +259,6 @@ vehicle_classes = [0, 1, 8, 9]       # airplane, automobile, ship, truck
 | Baseline | 85.2% | 45.3% | 42.1% |
 | CE Ensemble | **87.1%** | **48.7%** | **45.2%** |
 
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🙏 Acknowledgments
-
-- Based on the adversarial robustness framework
-- Inspired by TRADES and MART adversarial training methods
-- Uses AutoAttack for comprehensive evaluation
 
 
 ---
