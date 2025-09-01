@@ -5,11 +5,11 @@
 [![CUDA](https://img.shields.io/badge/CUDA-11.8+-green.svg)](https://developer.nvidia.com/cuda-toolkit)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-## 📖 Overview
+## Overview
 
 This project implements a **Multi-Model Ensemble approach with Confidence-Based Fusion** for improving adversarial robustness on CIFAR-10. The core idea is to replace a single-path CNN with a tree-structured/parallel convolutional neural network that can simultaneously improve both clean accuracy and adversarial robustness when combined with adversarial training methods like TRADES/MART.
 
-## 🎯 Key Innovation
+## Key Innovation
 
 ### Multi-Model Ensemble Architecture
 - **7-class Animal Model (M1)**: Specialized classifier for animal categories (bird, cat, deer, dog, frog, horse + unknown)
@@ -22,7 +22,7 @@ Final Prediction = Animal_Confidence × Animal_Logits + Vehicle_Confidence × Ve
 
 Where confidence is calculated as: `confidence = 1 - P(unknown_class)`
 
-## 🏗️ Architecture
+## Architecture
 
 ### Model Structure
 ```python
@@ -45,7 +45,7 @@ Total Loss = α₁ × Fusion_Loss + α₂ × Animal_Loss + α₃ × Vehicle_Loss
 
 ## 🚀 Quick Start
 
-### Environment Setup (A100 GPU)
+### Environment Setup 
 
 1. **Basic Preparation**
 ```bash
@@ -129,7 +129,6 @@ python adversarial_robustness_pytorch/train-parx.py \
   --num-adv-epochs 100 \
   --adv-eval-freq 10 \
   --beta 6 \
-  --train_submodels False \
   --unknown_classes True \
   --strategy constant
 ```
@@ -285,17 +284,6 @@ vehicle_classes = [0, 1, 8, 9]       # airplane, automobile, ship, truck
 | Baseline | 85.2% | 45.3% | 42.1% |
 | CE Ensemble | **87.1%** | **48.7%** | **45.2%** |
 
-### Sub-category Performance
-- **Animal Classes**: 89.3% clean, 51.2% adversarial
-- **Vehicle Classes**: 84.8% clean, 46.1% adversarial
-
-## 🤝 Contributing
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
 
 ## 📄 License
 
@@ -307,9 +295,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - Inspired by TRADES and MART adversarial training methods
 - Uses AutoAttack for comprehensive evaluation
 
-## 📞 Contact
-
-For questions and discussions, please open an issue on GitHub.
 
 ---
 
