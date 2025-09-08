@@ -1,7 +1,17 @@
+# two_stage_ce_pipeline.py
 import os
 import sys
 import copy
 from typing import Tuple, List
+
+# ====== 方案B：在代码里注入 sys.path，确保能以 `from core...` 导入 ======
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+ARP_ROOT = os.path.join(PROJECT_ROOT, 'adversarial_robustness_pytorch')
+if ARP_ROOT not in sys.path:
+    sys.path.insert(0, ARP_ROOT)  # 关键：确保 `core` 是一个可导入的顶级包
+
+# 现在可以用 core.* 形式导入
+from core.models.resnet import LightResnet, BasicBlock
 
 import torch
 import torch.nn as nn
@@ -10,15 +20,6 @@ from torch.utils.data import DataLoader, Subset
 
 import torchvision
 import torchvision.transforms as T
-
-# Ensure subpackage 'core' is importable when models/treeresnet references it
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-ARP_ROOT = os.path.join(PROJECT_ROOT, 'adversarial_robustness_pytorch')
-if ARP_ROOT not in sys.path:
-    sys.path.insert(0, ARP_ROOT)
-
-from core.models.resnet import LightResnet, BasicBlock
-
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -32,7 +33,7 @@ def build_lightresnet20(num_classes: int) -> LightResnet:
     return model.to(DEVICE)
 
 
-def get_cifar10_dataloaders(data_dir: str, batch_size: int = 256) -> Tuple[DataLoader, DataLoader]:
+def get_cifar10_dataloaders(data_dir: str, batch_size: int = 256, num_workers: int = 2) -> Tuple[DataLoader, DataLoader]:
     transform_train = T.Compose([
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
@@ -45,8 +46,14 @@ def get_cifar10_dataloaders(data_dir: str, batch_size: int = 256) -> Tuple[DataL
     train_set = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=True, transform=transform_train)
     test_set = torchvision.datasets.CIFAR10(root=data_dir, train=False, download=True, transform=transform_test)
 
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
+    )
+    test_loader = DataLoader(
+        test_set, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
+    )
     return train_loader, test_loader
 
 
@@ -71,7 +78,7 @@ class RemappedSubset(torch.utils.data.Dataset):
         return x, y
 
 
-def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int = 256, train: bool = True) -> DataLoader:
+def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int = 256, train: bool = True, num_workers: int = 2) -> DataLoader:
     transform = T.Compose([
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
@@ -81,7 +88,10 @@ def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: in
     ds = torchvision.datasets.CIFAR10(root=data_dir, train=train, download=True, transform=transform)
     indices, remap = filter_and_remap_indices(ds, keep_labels)
     sub = RemappedSubset(ds, indices, remap)
-    loader = DataLoader(sub, batch_size=batch_size, shuffle=train, num_workers=4, pin_memory=True)
+    loader = DataLoader(
+        sub, batch_size=batch_size, shuffle=train,
+        num_workers=num_workers, pin_memory=torch.cuda.is_available()
+    )
     return loader
 
 
@@ -212,6 +222,7 @@ def main():
     parser.add_argument('--epochs-m', type=int, default=50, help='epochs for M1/M2 training')
     parser.add_argument('--epochs-g', type=int, default=50, help='epochs for G training')
     parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--num-workers', type=int, default=2, help='dataloader workers (容器或mac出错可设为0)')
     parser.add_argument('--save-dir', type=str, default='./log_ce_optimization_two_stage')
     args = parser.parse_args()
 
@@ -220,12 +231,14 @@ def main():
     # Build loaders
     print('Preparing data ...')
     # Full loaders for embedding extraction and G training
-    full_train_loader, full_test_loader = get_cifar10_dataloaders(args.data_dir, batch_size=args.batch_size)
+    full_train_loader, full_test_loader = get_cifar10_dataloaders(
+        args.data_dir, batch_size=args.batch_size, num_workers=args.num_workers
+    )
     # Filtered loaders for M1 (6-class animal) and M2 (4-class vehicle)
-    m1_train_loader = build_filtered_loaders(args.data_dir, ANIMAL_CLASSES, batch_size=args.batch_size, train=True)
-    m1_test_loader = build_filtered_loaders(args.data_dir, ANIMAL_CLASSES, batch_size=args.batch_size, train=False)
-    m2_train_loader = build_filtered_loaders(args.data_dir, VEHICLE_CLASSES, batch_size=args.batch_size, train=True)
-    m2_test_loader = build_filtered_loaders(args.data_dir, VEHICLE_CLASSES, batch_size=args.batch_size, train=False)
+    m1_train_loader = build_filtered_loaders(args.data_dir, ANIMAL_CLASSES, batch_size=args.batch_size, train=True,  num_workers=args.num_workers)
+    m1_test_loader  = build_filtered_loaders(args.data_dir, ANIMAL_CLASSES, batch_size=args.batch_size, train=False, num_workers=args.num_workers)
+    m2_train_loader = build_filtered_loaders(args.data_dir, VEHICLE_CLASSES, batch_size=args.batch_size, train=True,  num_workers=args.num_workers)
+    m2_test_loader  = build_filtered_loaders(args.data_dir, VEHICLE_CLASSES, batch_size=args.batch_size, train=False, num_workers=args.num_workers)
 
     # Train M1 (6-class animal)
     print('Training M1 (6-class animal) ...')
@@ -259,5 +272,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-
