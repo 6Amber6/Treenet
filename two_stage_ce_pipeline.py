@@ -1,4 +1,5 @@
 import os
+import sys
 import copy
 from typing import Tuple, List
 
@@ -10,7 +11,13 @@ from torch.utils.data import DataLoader, Subset
 import torchvision
 import torchvision.transforms as T
 
-from adversarial_robustness_pytorch.core.models.resnet import LightResnet, BasicBlock
+# Ensure subpackage 'core' is importable when models/treeresnet references it
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+ARP_ROOT = os.path.join(PROJECT_ROOT, 'adversarial_robustness_pytorch')
+if ARP_ROOT not in sys.path:
+    sys.path.insert(0, ARP_ROOT)
+
+from core.models.resnet import LightResnet, BasicBlock
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
