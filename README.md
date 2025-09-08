@@ -59,8 +59,8 @@ apt-get update -y && apt-get install -y git tmux htop unzip
 2. **Clone Repository**
 ```bash
 cd /workspace
-git clone https://github.com/your-username/CE-optimization-solution.git
-cd CE-optimization-solution
+git clone https://github.com/6Amber6/Treenet.git
+cd Treenet
 ```
 
 3. **Create Python Virtual Environment**
