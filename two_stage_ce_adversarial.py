@@ -93,7 +93,7 @@ def trades_loss(model, x_natural, y, optimizer, step_size=2/255, epsilon=8/255, 
     batch_size = len(x_natural)
     
     # Generate adversarial example
-    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).cuda().detach()
+    x_adv = x_natural.detach() + 0.001 * torch.randn(x_natural.shape).to(DEVICE).detach()
     
     for _ in range(perturb_steps):
         x_adv.requires_grad_()
@@ -152,7 +152,6 @@ def train_classifier_adversarial(model: nn.Module, train_loader: DataLoader, tes
             print(f"Epoch {epoch:03d} | Train Loss {(running_loss/total):.4f} | Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}")
 
 
-@torch.no_grad()
 def eval_classifier_adversarial(model: nn.Module, loader: DataLoader) -> Tuple[float, float]:
     model.eval()
     
@@ -160,10 +159,11 @@ def eval_classifier_adversarial(model: nn.Module, loader: DataLoader) -> Tuple[f
     correct_clean, total = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        logits = model(x)
-        preds = logits.argmax(dim=1)
-        correct_clean += (preds == y).sum().item()
-        total += y.size(0)
+        with torch.no_grad():
+            logits = model(x)
+            preds = logits.argmax(dim=1)
+            correct_clean += (preds == y).sum().item()
+            total += y.size(0)
     clean_acc = correct_clean / max(total, 1)
     
     # Adversarial accuracy with PGD attack
@@ -173,10 +173,11 @@ def eval_classifier_adversarial(model: nn.Module, loader: DataLoader) -> Tuple[f
         x, y = x.to(DEVICE), y.to(DEVICE)
         with ctx_noparamgrad_and_eval(model):
             x_adv, _ = attack.perturb(x, y)
-        logits = model(x_adv)
-        preds = logits.argmax(dim=1)
-        correct_adv += (preds == y).sum().item()
-        total += y.size(0)
+        with torch.no_grad():
+            logits = model(x_adv)
+            preds = logits.argmax(dim=1)
+            correct_adv += (preds == y).sum().item()
+            total += y.size(0)
     adv_acc = correct_adv / max(total, 1)
     
     return clean_acc, adv_acc
