@@ -20,7 +20,7 @@ from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
 
-# ----- Make local 'core' package importable (Plan B path injection) -----
+# ----- Plan B: make local 'core' package importable -----
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 ARP_ROOT = os.path.join(PROJECT_ROOT, 'adversarial_robustness_pytorch')
 if ARP_ROOT not in sys.path:
@@ -40,7 +40,7 @@ import wandb
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# CIFAR-10 normalization (needed for our filtered loaders)
+# CIFAR-10 normalization (for our filtered loaders)
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 
@@ -146,7 +146,7 @@ def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: in
 def init_attack_for_model(model: nn.Module, args):
     """
     Create train-time attack and a stronger eval-time attack for the given model.
-    Use parser_train() flags: --attack, --attack-eps, --attack-iter, --attack-step
+    parser_train() should define: --attack, --attack-eps, --attack-iter, --attack-step
     """
     crit = nn.CrossEntropyLoss()
     atk = create_attack(model, crit, args.attack, args.attack_eps, args.attack_iter, args.attack_step, rand_init_type='uniform')
@@ -179,8 +179,8 @@ def train_one_model(model: nn.Module,
                     tag: str):
     """
     Train a single classifier (M1 or M2) with TRADES/MART/CE.
-    Adversarial examples are crafted in IMAGE space against the same model.
-    We always step the optimizer here (do NOT rely on utils to step).
+    For TRADES/MART we pass the optimizer into the loss function (which steps internally).
+    For CE we step outside here.
     """
     _, eval_atk = init_attack_for_model(model, args)
     ce = nn.CrossEntropyLoss()
@@ -193,21 +193,39 @@ def train_one_model(model: nn.Module,
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                loss_all = trades_loss(model, x, y, optimizer=None, beta=args.beta)
+                # trades_loss will zero_grad/backward/step internally
+                loss_all = trades_loss(
+                    model, x, y, optimizer=optimizer,
+                    beta=args.beta,
+                    step_size=getattr(args, 'attack_step', 2/255),
+                    epsilon=getattr(args, 'attack_eps', 8/255),
+                    perturb_steps=getattr(args, 'attack_iter', 10),
+                )
                 loss_main = _main_loss(loss_all)
+
             elif args.trainer == 'mart':
-                loss_all = mart_loss(model, x, y, optimizer=None, beta=args.beta)
+                # mart_loss will zero_grad/backward/step internally
+                loss_all = mart_loss(
+                    model, x, y, optimizer=optimizer,
+                    beta=args.beta,
+                    step_size=getattr(args, 'attack_step', 2/255),
+                    epsilon=getattr(args, 'attack_eps', 8/255),
+                    perturb_steps=getattr(args, 'attack_iter', 10),
+                )
                 loss_main = _main_loss(loss_all)
+
             else:
+                # Plain CE training outside
                 logits = model(x)
                 loss_main = ce(logits, y)
+                optimizer.zero_grad(set_to_none=True)
+                loss_main.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss_main.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+            # Stats only (for TRADES/MART the loss here is just for logging)
+            run_loss += float(loss_main.detach().item()) * x.size(0)
 
-            run_loss += loss_main.item() * x.size(0)
             with torch.no_grad():
                 preds = model(x).argmax(dim=1)
                 correct += (preds == y).sum().item()
@@ -252,8 +270,9 @@ def train_fusion(model: FusionModel,
                  logger: Logger):
     """
     Train Fusion end-to-end with TRADES/MART/CE.
-    Adversarial examples are generated in IMAGE space *against FusionModel*.
-    We always step the optimizer here (do NOT rely on utils to step).
+    Adversarial examples are generated in IMAGE space against FusionModel.
+    For TRADES/MART we pass the optimizer into the loss function (which steps internally).
+    For CE we step outside here.
     """
     _, eval_atk = init_attack_for_model(model, args)
     ce = nn.CrossEntropyLoss()
@@ -266,21 +285,35 @@ def train_fusion(model: FusionModel,
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                loss_all = trades_loss(model, x, y, optimizer=None, beta=args.beta)
+                loss_all = trades_loss(
+                    model, x, y, optimizer=optimizer,
+                    beta=args.beta,
+                    step_size=getattr(args, 'attack_step', 2/255),
+                    epsilon=getattr(args, 'attack_eps', 8/255),
+                    perturb_steps=getattr(args, 'attack_iter', 10),
+                )
                 loss_main = _main_loss(loss_all)
+
             elif args.trainer == 'mart':
-                loss_all = mart_loss(model, x, y, optimizer=None, beta=args.beta)
+                loss_all = mart_loss(
+                    model, x, y, optimizer=optimizer,
+                    beta=args.beta,
+                    step_size=getattr(args, 'attack_step', 2/255),
+                    epsilon=getattr(args, 'attack_eps', 8/255),
+                    perturb_steps=getattr(args, 'attack_iter', 10),
+                )
                 loss_main = _main_loss(loss_all)
+
             else:
                 logits = model(x)
                 loss_main = ce(logits, y)
+                optimizer.zero_grad(set_to_none=True)
+                loss_main.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
 
-            optimizer.zero_grad(set_to_none=True)
-            loss_main.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
+            run_loss += float(loss_main.detach().item()) * x.size(0)
 
-            run_loss += loss_main.item() * x.size(0)
             with torch.no_grad():
                 preds = model(x).argmax(1)
                 correct += (preds == y).sum().item()
@@ -301,7 +334,7 @@ def main():
     # Use shared parser; it already defines --beta, --attack, --attack-eps, --attack-iter, --attack-step, etc.
     parse = parser_train()
 
-    # Add only extra knobs; DO NOT re-add --beta (avoid conflict)
+    # Add only our extra knobs; DO NOT re-add --beta (avoid conflict)
     parse.add_argument('--epochs-m', type=int, default=50, help='epochs for M1/M2 training')
     parse.add_argument('--epochs-g', type=int, default=50, help='epochs for Fusion training')
     parse.add_argument('--trainer', type=str, default='trades', choices=['trades', 'mart', 'ce'],
@@ -332,7 +365,7 @@ def main():
     del train_dataset, test_dataset
 
     # Filtered loaders for submodels with our own transforms
-    workers = getattr(args, 'workers', 4)
+    workers = getattr(args, 'workers', 4)  # fallback if parser doesn't define it
     m1_train_loader = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=True,  num_workers=workers)
     m1_test_loader  = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=workers)
     m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=workers)
@@ -358,46 +391,3 @@ def main():
     _, m1_eval_atk = init_attack_for_model(m1, args)
     _, m2_eval_atk = init_attack_for_model(m2, args)
     c1, a1 = eval_clean_and_adv(m1, m1_test_loader, m1_eval_atk)
-    c2, a2 = eval_clean_and_adv(m2, m2_test_loader, m2_eval_atk)
-    logger.log(f'[M1] Clean: {c1:.4f} | Adv: {a1:.4f}')
-    logger.log(f'[M2] Clean: {c2:.4f} | Adv: {a2:.4f}')
-
-    # ------------------ Stage 2: Fusion end-to-end ------------------
-    head = HeadG(in_dim=128, num_classes=10).to(DEVICE)
-    fusion = FusionModel(m1, m2, head).to(DEVICE)
-
-    fusion_opt = torch.optim.SGD(fusion.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=False)
-    fusion_sch = torch.optim.lr_scheduler.MultiStepLR(fusion_opt, milestones=[75, 90], gamma=0.1)
-
-    logger.log(f'Training Fusion (M1+M2+G) for {args.epochs_g} epochs with {args.trainer.upper()}...')
-    train_fusion(fusion, fusion_opt, fusion_sch, full_train_loader, full_test_loader, args, logger)
-
-    # Final eval on Fusion
-    _, f_eval_atk = init_attack_for_model(fusion, args)
-    cf, af = eval_clean_and_adv(fusion, full_test_loader, f_eval_atk)
-    logger.log(f'[Fusion] Final Clean: {cf:.4f} | Final Adv: {af:.4f}')
-
-    # Save weights
-    os.makedirs(LOG_DIR, exist_ok=True)
-    torch.save({'model_state_dict': m1.state_dict()}, os.path.join(LOG_DIR, 'M1_animal_6cls.pt'))
-    torch.save({'model_state_dict': m2.state_dict()}, os.path.join(LOG_DIR, 'M2_vehicle_4cls.pt'))
-    torch.save({'model_state_dict': head.state_dict()}, os.path.join(LOG_DIR, 'G_head_10cls.pt'))
-    torch.save({'model_state_dict': fusion.state_dict()}, os.path.join(LOG_DIR, 'Fusion_end2end.pt'))
-    logger.log(f'Saved models to {LOG_DIR}')
-
-    # Optional: wandb summary
-    try:
-        wandb.init(project="two-stage-ce", name=args.desc, reinit=True)
-        wandb.summary["m1_clean_acc"] = c1
-        wandb.summary["m1_adv_acc"] = a1
-        wandb.summary["m2_clean_acc"] = c2
-        wandb.summary["m2_adv_acc"] = a2
-        wandb.summary["fusion_clean_acc"] = cf
-        wandb.summary["fusion_adv_acc"] = af
-        wandb.finish()
-    except Exception:
-        pass
-
-
-if __name__ == '__main__':
-    main()
