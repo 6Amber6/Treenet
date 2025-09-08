@@ -391,3 +391,46 @@ def main():
     _, m1_eval_atk = init_attack_for_model(m1, args)
     _, m2_eval_atk = init_attack_for_model(m2, args)
     c1, a1 = eval_clean_and_adv(m1, m1_test_loader, m1_eval_atk)
+    c2, a2 = eval_clean_and_adv(m2, m2_test_loader, m2_eval_atk)
+    logger.log(f'[M1] Clean: {c1:.4f} | Adv: {a1:.4f}')
+    logger.log(f'[M2] Clean: {c2:.4f} | Adv: {a2:.4f}')
+
+    # ------------------ Stage 2: Fusion end-to-end ------------------
+    head = HeadG(in_dim=128, num_classes=10).to(DEVICE)
+    fusion = FusionModel(m1, m2, head).to(DEVICE)
+
+    fusion_opt = torch.optim.SGD(fusion.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=False)
+    fusion_sch = torch.optim.lr_scheduler.MultiStepLR(fusion_opt, milestones=[75, 90], gamma=0.1)
+
+    logger.log(f'Training Fusion (M1+M2+G) for {args.epochs_g} epochs with {args.trainer.upper()}...')
+    train_fusion(fusion, fusion_opt, fusion_sch, full_train_loader, full_test_loader, args, logger)
+
+    # Final eval on Fusion
+    _, f_eval_atk = init_attack_for_model(fusion, args)
+    cf, af = eval_clean_and_adv(fusion, full_test_loader, f_eval_atk)
+    logger.log(f'[Fusion] Final Clean: {cf:.4f} | Final Adv: {af:.4f}')
+
+    # Save weights
+    os.makedirs(LOG_DIR, exist_ok=True)
+    torch.save({'model_state_dict': m1.state_dict()}, os.path.join(LOG_DIR, 'M1_animal_6cls.pt'))
+    torch.save({'model_state_dict': m2.state_dict()}, os.path.join(LOG_DIR, 'M2_vehicle_4cls.pt'))
+    torch.save({'model_state_dict': head.state_dict()}, os.path.join(LOG_DIR, 'G_head_10cls.pt'))
+    torch.save({'model_state_dict': fusion.state_dict()}, os.path.join(LOG_DIR, 'Fusion_end2end.pt'))
+    logger.log(f'Saved models to {LOG_DIR}')
+
+    # Optional: wandb summary
+    try:
+        wandb.init(project="two-stage-ce", name=args.desc, reinit=True)
+        wandb.summary["m1_clean_acc"] = c1
+        wandb.summary["m1_adv_acc"] = a1
+        wandb.summary["m2_clean_acc"] = c2
+        wandb.summary["m2_adv_acc"] = a2
+        wandb.summary["fusion_clean_acc"] = cf
+        wandb.summary["fusion_adv_acc"] = af
+        wandb.finish()
+    except Exception:
+        pass
+
+
+if __name__ == '__main__':
+    main()
