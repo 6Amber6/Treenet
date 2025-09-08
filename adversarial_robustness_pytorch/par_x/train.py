@@ -405,7 +405,7 @@ class ParEnsemble(object):
 
         return loss, batch_metrics  
 
-    def eval(self, dataloader, adversarial=False):
+    def eval(self, dataloader, adversar00ial=False):
         """
         Evaluate performance of the model.
         """
