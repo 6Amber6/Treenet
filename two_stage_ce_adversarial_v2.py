@@ -1,23 +1,21 @@
 """
 Pipeline:
-  1) Train M1 (6-class animal) with adversarial training (TRADES/MART/CE depending on parser flags)
-  2) Train M2 (4-class vehicle) with adversarial training
-  3) Build FusionModel that concatenates penultimate embeddings of M1 and M2 -> Head G (10-class)
-     and train it END-TO-END with the same adversarial training method on the full 10-class data
-  4) Report clean & adversarial accuracies for M1, M2, and FusionModel
+  1) Train M1 (6-class animal) with chosen objective (TRADES/MART/CE)
+  2) Train M2 (4-class vehicle) with chosen objective
+  3) Build FusionModel: concat penultimate embeddings of M1 & M2 -> Head G (10-class)
+     Train Fusion end-to-end in IMAGE space under the same objective
+  4) Report clean & adversarial accuracies for M1, M2, and Fusion
 """
 
 import os
 import sys
 import json
 import shutil
-import time
 from typing import List, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 
 import torchvision
 import torchvision.transforms as T
@@ -33,8 +31,7 @@ from core.data import get_data_info, load_data
 from core.models.resnet import LightResnet, BasicBlock
 from core.attacks import create_attack
 from core.utils.context import ctx_noparamgrad_and_eval
-from core.metrics import accuracy
-from core.utils import format_time, Logger, parser_train, seed
+from core.utils import Logger, parser_train, seed
 from core.utils.trades import trades_loss
 from core.utils.mart import mart_loss
 from core import animal_classes, vehicle_classes
@@ -43,7 +40,7 @@ import wandb
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# CIFAR-10 normalization (needed for custom filtered loaders)
+# CIFAR-10 normalization (needed for our filtered loaders)
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 
@@ -73,7 +70,7 @@ class HeadG(nn.Module):
 class FusionModel(nn.Module):
     """
     End-to-end fusion: x -> penult(M1(x)) || penult(M2(x)) -> Head G -> logits(10)
-    extract penultimate features using a forward hook on each sub-model's fc layer.
+    We extract penultimate features via a forward hook on each sub-model's fc layer.
     """
     def __init__(self, m1: LightResnet, m2: LightResnet, head: HeadG):
         super().__init__()
@@ -81,32 +78,21 @@ class FusionModel(nn.Module):
         self.m2 = m2
         self.head = head
 
-    @torch.no_grad()
-    def _penult(self, model: LightResnet, x: torch.Tensor) -> torch.Tensor:
-        feats = {}
-        def hook_fn(module, inp, out):
-            feats["feat"] = inp[0].detach()
-        h = model.fc.register_forward_hook(hook_fn)
-        _ = model(x)  # forward to populate feats
-        h.remove()
-        return feats["feat"]
-
     def forward(self, x):
-        # want gradients to flow through M1/M2 into G, so do NOT no_grad here.
+        # Let gradients flow through M1/M2 (no torch.no_grad here)
         feats = {}
         def hook_m1(module, inp, out): feats["m1"] = inp[0]
         def hook_m2(module, inp, out): feats["m2"] = inp[0]
         h1 = self.m1.fc.register_forward_hook(hook_m1)
         h2 = self.m2.fc.register_forward_hook(hook_m2)
 
-        # Forward both sub-models
         _ = self.m1(x)
         _ = self.m2(x)
 
         h1.remove(); h2.remove()
         f1 = feats["m1"]
         f2 = feats["m2"]
-        z = torch.cat([f1, f2], dim=1)  # [B, d1+d2] -> here each is 64-d penult typically (total 128)
+        z = torch.cat([f1, f2], dim=1)  # typically 64 + 64 = 128
         return self.head(z)
 
 
@@ -134,8 +120,9 @@ class RemappedSubset(torch.utils.data.Dataset):
         return x, y
 
 
-def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int, train: bool, num_workers: int = 4):
-    """Filtered loaders with the same normalization as the main pipeline."""
+def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int,
+                           train: bool, num_workers: int = 4):
+    """Filtered loaders with normalization aligned to the main pipeline."""
     transform = (T.Compose([
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
@@ -158,12 +145,12 @@ def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: in
 # --------------------------
 def init_attack_for_model(model: nn.Module, args):
     """
-    Create train-time attack and stronger eval-time attack for the given model.
-    We use parser_train() flags: --attack, --attack-eps, --attack-iter, --attack-step
+    Create train-time attack and a stronger eval-time attack for the given model.
+    Use parser_train() flags: --attack, --attack-eps, --attack-iter, --attack-step
     """
     crit = nn.CrossEntropyLoss()
     atk = create_attack(model, crit, args.attack, args.attack_eps, args.attack_iter, args.attack_step, rand_init_type='uniform')
-    # For eval, typically stronger/longer PGD:
+    # Stronger/longer PGD for evaluation:
     if args.attack in ['linf-pgd', 'l2-pgd']:
         eval_atk = create_attack(model, crit, args.attack, args.attack_eps, max(20, 2*args.attack_iter), args.attack_step)
     elif args.attack in ['fgsm', 'linf-df']:
@@ -175,6 +162,13 @@ def init_attack_for_model(model: nn.Module, args):
     return atk, eval_atk
 
 
+def _main_loss(loss):
+    """Return the primary loss tensor whether loss is a Tensor or a tuple."""
+    if isinstance(loss, (tuple, list)):
+        return loss[0]
+    return loss
+
+
 def train_one_model(model: nn.Module,
                     optimizer: torch.optim.Optimizer,
                     scheduler,
@@ -184,11 +178,12 @@ def train_one_model(model: nn.Module,
                     logger: Logger,
                     tag: str):
     """
-    Train a single classifier (M1 or M2) with TRADES/MART/CE depending on args.
-    Adversarial examples are crafted in IMAGE space using the model itself.
+    Train a single classifier (M1 or M2) with TRADES/MART/CE.
+    Adversarial examples are crafted in IMAGE space against the same model.
+    We always step the optimizer here (do NOT rely on utils to step).
     """
-    atk, eval_atk = init_attack_for_model(model, args)
-    criterion = nn.CrossEntropyLoss()
+    _, eval_atk = init_attack_for_model(model, args)
+    ce = nn.CrossEntropyLoss()
 
     for epoch in range(1, args.epochs_m + 1):
         model.train()
@@ -198,28 +193,23 @@ def train_one_model(model: nn.Module,
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                # trades_loss internally crafts adversarial examples for input x
-                # and returns CE(clean,y) + beta * KL(clean||adv)
-                loss = trades_loss(model, x, y, optimizer, beta=args.beta)
+                loss_all = trades_loss(model, x, y, optimizer=None, beta=args.beta)
+                loss_main = _main_loss(loss_all)
             elif args.trainer == 'mart':
-                loss = mart_loss(model, x, y, optimizer, beta=args.beta)
+                loss_all = mart_loss(model, x, y, optimizer=None, beta=args.beta)
+                loss_main = _main_loss(loss_all)
             else:
-                # plain CE training
                 logits = model(x)
-                loss = criterion(logits, y)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                loss_main = ce(logits, y)
 
-            if args.trainer in ['trades', 'mart']:
-                # trades_loss/mart_loss already zero_grad/backward/step inside (typical in many repos)
-                pass
+            optimizer.zero_grad(set_to_none=True)
+            loss_main.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
 
-            run_loss += loss.item() * x.size(0)
-
+            run_loss += loss_main.item() * x.size(0)
             with torch.no_grad():
-                logits = model(x)
-                preds = logits.argmax(dim=1)
+                preds = model(x).argmax(dim=1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
@@ -233,18 +223,16 @@ def train_one_model(model: nn.Module,
 
 @torch.no_grad()
 def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[float, float]:
-    """Evaluate clean and adversarial accuracy using the provided attack (image-space)."""
+    """Evaluate clean and adversarial accuracy with the provided (image-space) attack."""
     model.eval()
     clean_correct, adv_correct, total = 0, 0, 0
 
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
 
-        # clean
         logits = model(x)
         clean_correct += (logits.argmax(1) == y).sum().item()
 
-        # adv
         with ctx_noparamgrad_and_eval(model):
             x_adv, _ = attack.perturb(x, y)
         logits_adv = model(x_adv)
@@ -263,10 +251,11 @@ def train_fusion(model: FusionModel,
                  args,
                  logger: Logger):
     """
-    Train FusionModel end-to-end with TRADES/MART/CE.
-    Attacks are generated in IMAGE space against FusionModel.
+    Train Fusion end-to-end with TRADES/MART/CE.
+    Adversarial examples are generated in IMAGE space *against FusionModel*.
+    We always step the optimizer here (do NOT rely on utils to step).
     """
-    atk, eval_atk = init_attack_for_model(model, args)
+    _, eval_atk = init_attack_for_model(model, args)
     ce = nn.CrossEntropyLoss()
 
     for epoch in range(1, args.epochs_g + 1):
@@ -277,20 +266,21 @@ def train_fusion(model: FusionModel,
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                loss = trades_loss(model, x, y, optimizer, beta=args.beta)
+                loss_all = trades_loss(model, x, y, optimizer=None, beta=args.beta)
+                loss_main = _main_loss(loss_all)
             elif args.trainer == 'mart':
-                loss = mart_loss(model, x, y, optimizer, beta=args.beta)
+                loss_all = mart_loss(model, x, y, optimizer=None, beta=args.beta)
+                loss_main = _main_loss(loss_all)
             else:
                 logits = model(x)
-                loss = ce(logits, y)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                loss_main = ce(logits, y)
 
-            if args.trainer in ['trades', 'mart']:
-                pass
+            optimizer.zero_grad(set_to_none=True)
+            loss_main.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+            optimizer.step()
 
-            run_loss += loss.item() * x.size(0)
+            run_loss += loss_main.item() * x.size(0)
             with torch.no_grad():
                 preds = model(x).argmax(1)
                 correct += (preds == y).sum().item()
@@ -308,15 +298,14 @@ def train_fusion(model: FusionModel,
 #   Main
 # --------------------------
 def main():
-    # Use the shared parser from your repo; it already defines many useful flags,
-    # including --beta, --attack, --attack-eps, --attack-iter, --attack-step, etc.
+    # Use shared parser; it already defines --beta, --attack, --attack-eps, --attack-iter, --attack-step, etc.
     parse = parser_train()
 
-    # Add only our extra knobs (do NOT re-add --beta to avoid conflict)
+    # Add only extra knobs; DO NOT re-add --beta (avoid conflict)
     parse.add_argument('--epochs-m', type=int, default=50, help='epochs for M1/M2 training')
-    parse.add_argument('--epochs-g', type=int, default=50, help='epochs for Fusion (G) training')
+    parse.add_argument('--epochs-g', type=int, default=50, help='epochs for Fusion training')
     parse.add_argument('--trainer', type=str, default='trades', choices=['trades', 'mart', 'ce'],
-                       help='adversarial training objective for all stages')
+                       help='training objective for all stages')
     args = parse.parse_args()
 
     # Paths & logging
@@ -329,35 +318,33 @@ def main():
     with open(os.path.join(LOG_DIR, 'args.txt'), 'w') as f:
         json.dump(vars(args), f, indent=4)
 
-    # Info & seeds
-    info = get_data_info(DATA_DIR)
+    # Seeds & device
     logger.log(f'Using device: {DEVICE}')
     seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
-    # Full 10-class loaders from your core.data loader (already normalized)
+    # Full 10-class loaders (already normalized inside your repo loader)
     train_dataset, test_dataset, full_train_loader, full_test_loader = load_data(
         DATA_DIR, args.batch_size, args.batch_size_validation,
         use_augmentation=args.augment, shuffle_train=True,
         aux_data_filename=args.aux_data_filename, unsup_fraction=args.unsup_fraction
     )
-    del train_dataset, test_dataset  # not needed further
+    del train_dataset, test_dataset
 
-    # Filtered loaders for M1/M2 (with our own normalized transforms)
+    # Filtered loaders for submodels with our own transforms
     workers = getattr(args, 'workers', 4)
-    m1_train_loader = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=True, num_workers=workers)
+    m1_train_loader = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=True,  num_workers=workers)
     m1_test_loader  = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=workers)
-    m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True, num_workers=workers)
+    m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=workers)
     m2_test_loader  = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=workers)
 
     # ------------------ Stage 1: Train M1/M2 ------------------
     m1 = build_lightresnet20(num_classes=len(animal_classes))
     m2 = build_lightresnet20(num_classes=len(vehicle_classes))
 
-    # Optimizers & schedulers for M1/M2 (robust-friendly defaults)
+    # Robust-friendly defaults; tune lr/weight_decay via CLI
     m1_opt = torch.optim.SGD(m1.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=False)
     m2_opt = torch.optim.SGD(m2.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=False)
-    # You can also swap to cosine + warmup if desired; keep MultiStep for consistency with earlier code
     m1_sch = torch.optim.lr_scheduler.MultiStepLR(m1_opt, milestones=[75, 90], gamma=0.1)
     m2_sch = torch.optim.lr_scheduler.MultiStepLR(m2_opt, milestones=[75, 90], gamma=0.1)
 
@@ -367,9 +354,9 @@ def main():
     logger.log(f'Training M2 (4-class vehicle) for {args.epochs_m} epochs with {args.trainer.upper()}...')
     train_one_model(m2, m2_opt, m2_sch, m2_train_loader, m2_test_loader, args, logger, tag='[M2]')
 
-    # Eval submodels (clean & adv)
-    m1_atk, m1_eval_atk = init_attack_for_model(m1, args)
-    m2_atk, m2_eval_atk = init_attack_for_model(m2, args)
+    # Evaluate submodels
+    _, m1_eval_atk = init_attack_for_model(m1, args)
+    _, m2_eval_atk = init_attack_for_model(m2, args)
     c1, a1 = eval_clean_and_adv(m1, m1_test_loader, m1_eval_atk)
     c2, a2 = eval_clean_and_adv(m2, m2_test_loader, m2_eval_atk)
     logger.log(f'[M1] Clean: {c1:.4f} | Adv: {a1:.4f}')
@@ -379,8 +366,6 @@ def main():
     head = HeadG(in_dim=128, num_classes=10).to(DEVICE)
     fusion = FusionModel(m1, m2, head).to(DEVICE)
 
-    # Fusion optimizer/scheduler
-    # Tip: often better to fine-tune with a slightly smaller LR; but we keep args.lr for consistency
     fusion_opt = torch.optim.SGD(fusion.parameters(), lr=args.lr, momentum=0.9, weight_decay=args.weight_decay, nesterov=False)
     fusion_sch = torch.optim.lr_scheduler.MultiStepLR(fusion_opt, milestones=[75, 90], gamma=0.1)
 
@@ -388,7 +373,7 @@ def main():
     train_fusion(fusion, fusion_opt, fusion_sch, full_train_loader, full_test_loader, args, logger)
 
     # Final eval on Fusion
-    f_atk, f_eval_atk = init_attack_for_model(fusion, args)
+    _, f_eval_atk = init_attack_for_model(fusion, args)
     cf, af = eval_clean_and_adv(fusion, full_test_loader, f_eval_atk)
     logger.log(f'[Fusion] Final Clean: {cf:.4f} | Final Adv: {af:.4f}')
 
@@ -410,7 +395,7 @@ def main():
         wandb.summary["fusion_clean_acc"] = cf
         wandb.summary["fusion_adv_acc"] = af
         wandb.finish()
-    except:
+    except Exception:
         pass
 
 
