@@ -231,12 +231,13 @@ def train_one_model(model: nn.Module,
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        if scheduler is not None:
-            scheduler.step()
-
         if epoch % 5 == 0 or epoch == 1:
             clean_acc, adv_acc = eval_clean_and_adv(model, test_loader, eval_atk)
             logger.log(f'{tag} Epoch {epoch:03d} | Train Loss {(run_loss/max(total,1)):.4f} | Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
+
+        # Step scheduler after training epoch
+        if scheduler is not None:
+            scheduler.step()
 
 
 def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[float, float]:
@@ -322,12 +323,13 @@ def train_fusion(model: FusionModel,
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        if scheduler is not None:
-            scheduler.step()
-
         if epoch % 5 == 0 or epoch == 1:
             clean_acc, adv_acc = eval_clean_and_adv(model, test_loader, eval_atk)
             logger.log(f'[Fusion] Epoch {epoch:03d} | Train Loss {(run_loss/max(total,1)):.4f} | Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
+
+        # Step scheduler after training epoch
+        if scheduler is not None:
+            scheduler.step()
 
 
 # --------------------------
@@ -373,6 +375,19 @@ def main():
     m1_test_loader  = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=workers)
     m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=workers)
     m2_test_loader  = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=workers)
+    
+    # Debug: Check data loading
+    logger.log(f'Animal classes: {animal_classes}')
+    logger.log(f'Vehicle classes: {vehicle_classes}')
+    logger.log(f'M1 train loader size: {len(m1_train_loader.dataset)}')
+    logger.log(f'M1 test loader size: {len(m1_test_loader.dataset)}')
+    logger.log(f'M2 train loader size: {len(m2_train_loader.dataset)}')
+    logger.log(f'M2 test loader size: {len(m2_test_loader.dataset)}')
+    
+    # Check a sample batch
+    for x, y in m1_train_loader:
+        logger.log(f'M1 sample batch: x.shape={x.shape}, y.shape={y.shape}, y.unique()={y.unique()}')
+        break
 
     # ------------------ Stage 1: Train M1/M2 ------------------
     m1 = build_lightresnet20(num_classes=len(animal_classes))
