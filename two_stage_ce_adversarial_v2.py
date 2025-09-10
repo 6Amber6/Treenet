@@ -246,6 +246,11 @@ def train_one_model(model: nn.Module,
             logger.log(f'{tag} Epoch {epoch:03d} | Train Loss {(run_loss/max(total,1)):.4f} | Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
 
 
+@torch.no_grad()
+def _eval_clean(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
+    return model(x)
+
+
 def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[float, float]:
     """
     Evaluate clean and adversarial accuracy with the provided (image-space) attack.
@@ -388,12 +393,6 @@ def main():
     m1_test_loader  = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=workers)
     m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=workers)
     m2_test_loader  = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=workers)
-    
-    # Basic debug info
-    logger.log(f'Animal classes: {animal_classes} (M1: {len(animal_classes)} classes)')
-    logger.log(f'Vehicle classes: {vehicle_classes} (M2: {len(vehicle_classes)} classes)')
-    logger.log(f'M1 train/test samples: {len(m1_train_loader.dataset)}/{len(m1_test_loader.dataset)}')
-    logger.log(f'M2 train/test samples: {len(m2_train_loader.dataset)}/{len(m2_test_loader.dataset)}')
 
     # ------------------ Stage 1: Train M1/M2 ------------------
     m1 = build_lightresnet20(num_classes=len(animal_classes))
