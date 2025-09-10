@@ -248,12 +248,15 @@ def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[fl
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
 
-        logits = model(x)
-        clean_correct += (logits.argmax(1) == y).sum().item()
+        with torch.no_grad():
+            logits = model(x)
+            clean_correct += (logits.argmax(1) == y).sum().item()
 
-        with ctx_noparamgrad_and_eval(model):
-            x_adv, _ = attack.perturb(x, y)
-        logits_adv = model(x_adv)
+        # Generate adversarial examples (need gradients for PGD)
+        model.eval()
+        x_adv, _ = attack.perturb(x, y)
+        with torch.no_grad():
+            logits_adv = model(x_adv)
         adv_correct += (logits_adv.argmax(1) == y).sum().item()
 
         total += y.size(0)
