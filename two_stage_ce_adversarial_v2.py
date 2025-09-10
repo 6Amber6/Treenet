@@ -30,11 +30,15 @@ if ARP_ROOT not in sys.path:
 from core.data import get_data_info, load_data
 from core.models.resnet import LightResnet, BasicBlock
 from core.attacks import create_attack
-from core.utils.context import ctx_noparamgrad_and_eval
 from core.utils import Logger, parser_train, seed
 from core.utils.trades import trades_loss
 from core.utils.mart import mart_loss
-from core import animal_classes, vehicle_classes
+try:
+    from core import animal_classes, vehicle_classes  # preferred if defined in repo
+except Exception:
+    # Fallback to CIFAR-10 IDs
+    animal_classes = [2, 3, 4, 5, 6, 7]   # bird, cat, deer, dog, frog, horse
+    vehicle_classes = [0, 1, 8, 9]        # airplane, automobile, ship, truck
 
 import wandb
 
@@ -188,6 +192,7 @@ def train_one_model(model: nn.Module,
     for epoch in range(1, args.epochs_m + 1):
         model.train()
         total, correct, run_loss = 0, 0, 0.0
+        did_step = False
 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -202,6 +207,7 @@ def train_one_model(model: nn.Module,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
+                did_step = True
 
             elif args.trainer == 'mart':
                 # mart_loss will zero_grad/backward/step internally
@@ -213,6 +219,7 @@ def train_one_model(model: nn.Module,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
+                did_step = True
 
             else:
                 # Plain CE training outside
@@ -222,16 +229,16 @@ def train_one_model(model: nn.Module,
                 loss_main.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
+                did_step = True
 
-            # Stats only (for TRADES/MART the loss here is just for logging)
+            # Logging stats
             run_loss += float(loss_main.detach().item()) * x.size(0)
-
             with torch.no_grad():
                 preds = model(x).argmax(dim=1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        if scheduler is not None:
+        if scheduler is not None and did_step:
             scheduler.step()
 
         if epoch % 5 == 0 or epoch == 1:
@@ -239,22 +246,30 @@ def train_one_model(model: nn.Module,
             logger.log(f'{tag} Epoch {epoch:03d} | Train Loss {(run_loss/max(total,1)):.4f} | Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
 
 
-@torch.no_grad()
 def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[float, float]:
-    """Evaluate clean and adversarial accuracy with the provided (image-space) attack."""
+    """
+    Evaluate clean and adversarial accuracy with the provided (image-space) attack.
+
+    IMPORTANT: We must allow gradients during attack.perturb, so we do NOT wrap the whole
+    loop in torch.no_grad(). We enable grads only while crafting x_adv.
+    """
     model.eval()
     clean_correct, adv_correct, total = 0, 0, 0
 
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
 
-        logits = model(x)
-        clean_correct += (logits.argmax(1) == y).sum().item()
+        # clean
+        with torch.no_grad():
+            logits = model(x)
+            clean_correct += (logits.argmax(1) == y).sum().item()
 
-        with ctx_noparamgrad_and_eval(model):
+        # adv — need gradients ON for PGD/FGSM
+        with torch.enable_grad():
             x_adv, _ = attack.perturb(x, y)
-        logits_adv = model(x_adv)
-        adv_correct += (logits_adv.argmax(1) == y).sum().item()
+        with torch.no_grad():
+            logits_adv = model(x_adv)
+            adv_correct += (logits_adv.argmax(1) == y).sum().item()
 
         total += y.size(0)
 
@@ -280,6 +295,7 @@ def train_fusion(model: FusionModel,
     for epoch in range(1, args.epochs_g + 1):
         model.train()
         total, correct, run_loss = 0, 0, 0.0
+        did_step = False
 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -293,6 +309,7 @@ def train_fusion(model: FusionModel,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
+                did_step = True
 
             elif args.trainer == 'mart':
                 loss_all = mart_loss(
@@ -303,6 +320,7 @@ def train_fusion(model: FusionModel,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
+                did_step = True
 
             else:
                 logits = model(x)
@@ -311,15 +329,15 @@ def train_fusion(model: FusionModel,
                 loss_main.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
+                did_step = True
 
             run_loss += float(loss_main.detach().item()) * x.size(0)
-
             with torch.no_grad():
                 preds = model(x).argmax(1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        if scheduler is not None:
+        if scheduler is not None and did_step:
             scheduler.step()
 
         if epoch % 5 == 0 or epoch == 1:
@@ -370,6 +388,12 @@ def main():
     m1_test_loader  = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=workers)
     m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=workers)
     m2_test_loader  = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=workers)
+    
+    # Basic debug info
+    logger.log(f'Animal classes: {animal_classes} (M1: {len(animal_classes)} classes)')
+    logger.log(f'Vehicle classes: {vehicle_classes} (M2: {len(vehicle_classes)} classes)')
+    logger.log(f'M1 train/test samples: {len(m1_train_loader.dataset)}/{len(m1_test_loader.dataset)}')
+    logger.log(f'M2 train/test samples: {len(m2_train_loader.dataset)}/{len(m2_test_loader.dataset)}')
 
     # ------------------ Stage 1: Train M1/M2 ------------------
     m1 = build_lightresnet20(num_classes=len(animal_classes))
