@@ -5,6 +5,12 @@ Pipeline:
   3) Build FusionModel: concat penultimate embeddings of M1 & M2 -> Head G (10-class)
      Train Fusion end-to-end in IMAGE space under the same objective
   4) Report clean & adversarial accuracies for M1, M2, and Fusion
+
+Important changes:
+  - All dataloaders use *no normalization* (images in [0,1]) so attacks (PGD/FGSM)
+    correctly perturb in pixel space.
+  - Do NOT wrap adversarial generation with torch.no_grad(); PGD needs gradients.
+  - TRADES/MART receive optimizer and handle zero_grad/backward/step internally.
 """
 
 import os
@@ -27,26 +33,16 @@ if ARP_ROOT not in sys.path:
     sys.path.insert(0, ARP_ROOT)
 
 # ----- Imports from your codebase -----
-from core.data import get_data_info, load_data
 from core.models.resnet import LightResnet, BasicBlock
 from core.attacks import create_attack
 from core.utils import Logger, parser_train, seed
 from core.utils.trades import trades_loss
 from core.utils.mart import mart_loss
-try:
-    from core import animal_classes, vehicle_classes  # preferred if defined in repo
-except Exception:
-    # Fallback to CIFAR-10 IDs
-    animal_classes = [2, 3, 4, 5, 6, 7]   # bird, cat, deer, dog, frog, horse
-    vehicle_classes = [0, 1, 8, 9]        # airplane, automobile, ship, truck
+from core import animal_classes, vehicle_classes
 
 import wandb
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# CIFAR-10 normalization (for our filtered loaders)
-CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
-CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 
 
 # --------------------------
@@ -101,8 +97,28 @@ class FusionModel(nn.Module):
 
 
 # --------------------------
-#   Dataloaders
+#   Dataloaders (NO normalization)
 # --------------------------
+def get_full_cifar10_loaders(data_dir: str, batch_size: int, num_workers: int = 4):
+    """Full CIFAR-10 with NO Normalize (keeps images in [0,1] for attacks)."""
+    transform_train = T.Compose([
+        T.RandomCrop(32, padding=4),
+        T.RandomHorizontalFlip(),
+        T.ToTensor(),
+    ])
+    transform_test = T.Compose([T.ToTensor()])
+
+    train_set = torchvision.datasets.CIFAR10(data_dir, train=True, download=True, transform=transform_train)
+    test_set  = torchvision.datasets.CIFAR10(data_dir, train=False, download=True, transform=transform_test)
+
+    pin = torch.cuda.is_available()
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=pin)
+    test_loader  = DataLoader(test_set, batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=pin)
+    return train_loader, test_loader
+
+
 def filter_and_remap_indices(dataset: torchvision.datasets.CIFAR10, keep_labels: List[int]):
     indices = [i for i, (_, y) in enumerate(dataset) if y in keep_labels]
     remap = {old: new for new, old in enumerate(keep_labels)}
@@ -126,16 +142,13 @@ class RemappedSubset(torch.utils.data.Dataset):
 
 def build_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int,
                            train: bool, num_workers: int = 4):
-    """Filtered loaders with normalization aligned to the main pipeline."""
+    """Filtered loaders aligned with full loaders (NO Normalize)."""
     transform = (T.Compose([
         T.RandomCrop(32, padding=4),
         T.RandomHorizontalFlip(),
         T.ToTensor(),
-        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ]) if train else T.Compose([
-        T.ToTensor(),
-        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ]))
+    ]) if train else T.Compose([T.ToTensor()]))
+
     ds = torchvision.datasets.CIFAR10(root=data_dir, train=train, download=True, transform=transform)
     indices, remap = filter_and_remap_indices(ds, keep_labels)
     sub = RemappedSubset(ds, indices, remap)
@@ -156,7 +169,8 @@ def init_attack_for_model(model: nn.Module, args):
     atk = create_attack(model, crit, args.attack, args.attack_eps, args.attack_iter, args.attack_step, rand_init_type='uniform')
     # Stronger/longer PGD for evaluation:
     if args.attack in ['linf-pgd', 'l2-pgd']:
-        eval_atk = create_attack(model, crit, args.attack, args.attack_eps, max(20, 2*args.attack_iter), args.attack_step)
+        eval_atk = create_attack(model, crit, args.attack, args.attack_eps,
+                                 max(20, 2*args.attack_iter), args.attack_step)
     elif args.attack in ['fgsm', 'linf-df']:
         eval_atk = create_attack(model, crit, 'linf-pgd', 8/255, 20, 2/255)
     elif args.attack in ['fgm', 'l2-df']:
@@ -192,13 +206,12 @@ def train_one_model(model: nn.Module,
     for epoch in range(1, args.epochs_m + 1):
         model.train()
         total, correct, run_loss = 0, 0, 0.0
-        did_step = False
 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                # trades_loss will zero_grad/backward/step internally
+                # trades_loss handles optimizer step internally
                 loss_all = trades_loss(
                     model, x, y, optimizer=optimizer,
                     beta=args.beta,
@@ -207,10 +220,9 @@ def train_one_model(model: nn.Module,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
-                did_step = True
 
             elif args.trainer == 'mart':
-                # mart_loss will zero_grad/backward/step internally
+                # mart_loss handles optimizer step internally
                 loss_all = mart_loss(
                     model, x, y, optimizer=optimizer,
                     beta=args.beta,
@@ -219,26 +231,24 @@ def train_one_model(model: nn.Module,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
-                did_step = True
 
             else:
-                # Plain CE training outside
+                # Plain CE
                 logits = model(x)
                 loss_main = ce(logits, y)
                 optimizer.zero_grad(set_to_none=True)
                 loss_main.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
-                did_step = True
 
-            # Logging stats
             run_loss += float(loss_main.detach().item()) * x.size(0)
+
             with torch.no_grad():
                 preds = model(x).argmax(dim=1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        if scheduler is not None and did_step:
+        if scheduler is not None:
             scheduler.step()
 
         if epoch % 5 == 0 or epoch == 1:
@@ -247,38 +257,44 @@ def train_one_model(model: nn.Module,
 
 
 @torch.no_grad()
-def _eval_clean(model: nn.Module, x: torch.Tensor) -> torch.Tensor:
-    return model(x)
+def eval_clean(model: nn.Module, loader: DataLoader) -> float:
+    """Clean accuracy helper (no attack)."""
+    model.eval()
+    correct, total = 0, 0
+    for x, y in loader:
+        x, y = x.to(DEVICE), y.to(DEVICE)
+        logits = model(x)
+        correct += (logits.argmax(1) == y).sum().item()
+        total += y.size(0)
+    return correct / max(total, 1)
 
 
 def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[float, float]:
     """
     Evaluate clean and adversarial accuracy with the provided (image-space) attack.
-
-    IMPORTANT: We must allow gradients during attack.perturb, so we do NOT wrap the whole
-    loop in torch.no_grad(). We enable grads only while crafting x_adv.
+    NOTE: we DO NOT wrap the attack in torch.no_grad(); PGD needs gradients.
     """
     model.eval()
-    clean_correct, adv_correct, total = 0, 0, 0
 
+    # Clean
+    clean_acc = eval_clean(model, loader)
+
+    # Adversarial (allow grads for x)
+    adv_correct, total = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-
-        # clean
-        with torch.no_grad():
-            logits = model(x)
-            clean_correct += (logits.argmax(1) == y).sum().item()
-
-        # adv — need gradients ON for PGD/FGSM
-        with torch.enable_grad():
-            x_adv, _ = attack.perturb(x, y)
+        # generate adversarial examples (this will run backward w.r.t. x)
+        x_adv, _ = attack.perturb(x, y)
+        # evaluate
         with torch.no_grad():
             logits_adv = model(x_adv)
             adv_correct += (logits_adv.argmax(1) == y).sum().item()
+            total += y.size(0)
+        # clear any leftover grads that attacks may have populated
+        model.zero_grad(set_to_none=True)
 
-        total += y.size(0)
-
-    return clean_correct / max(total, 1), adv_correct / max(total, 1)
+    adv_acc = adv_correct / max(total, 1)
+    return clean_acc, adv_acc
 
 
 def train_fusion(model: FusionModel,
@@ -300,7 +316,6 @@ def train_fusion(model: FusionModel,
     for epoch in range(1, args.epochs_g + 1):
         model.train()
         total, correct, run_loss = 0, 0, 0.0
-        did_step = False
 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -314,7 +329,6 @@ def train_fusion(model: FusionModel,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
-                did_step = True
 
             elif args.trainer == 'mart':
                 loss_all = mart_loss(
@@ -325,7 +339,6 @@ def train_fusion(model: FusionModel,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = _main_loss(loss_all)
-                did_step = True
 
             else:
                 logits = model(x)
@@ -334,15 +347,15 @@ def train_fusion(model: FusionModel,
                 loss_main.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
                 optimizer.step()
-                did_step = True
 
             run_loss += float(loss_main.detach().item()) * x.size(0)
+
             with torch.no_grad():
                 preds = model(x).argmax(1)
                 correct += (preds == y).sum().item()
                 total += y.size(0)
 
-        if scheduler is not None and did_step:
+        if scheduler is not None:
             scheduler.step()
 
         if epoch % 5 == 0 or epoch == 1:
@@ -379,16 +392,11 @@ def main():
     seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
-    # Full 10-class loaders (already normalized inside your repo loader)
-    train_dataset, test_dataset, full_train_loader, full_test_loader = load_data(
-        DATA_DIR, args.batch_size, args.batch_size_validation,
-        use_augmentation=args.augment, shuffle_train=True,
-        aux_data_filename=args.aux_data_filename, unsup_fraction=args.unsup_fraction
-    )
-    del train_dataset, test_dataset
+    # Full loaders (NO normalization)
+    workers = getattr(args, 'workers', 4) if hasattr(args, 'workers') else 4
+    full_train_loader, full_test_loader = get_full_cifar10_loaders(DATA_DIR, args.batch_size, num_workers=workers)
 
-    # Filtered loaders for submodels with our own transforms
-    workers = getattr(args, 'workers', 4)  # fallback if parser doesn't define it
+    # Filtered loaders for submodels (NO normalization)
     m1_train_loader = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=True,  num_workers=workers)
     m1_test_loader  = build_filtered_loaders(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=workers)
     m2_train_loader = build_filtered_loaders(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=workers)
