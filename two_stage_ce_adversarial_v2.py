@@ -239,7 +239,6 @@ def train_one_model(model: nn.Module,
             logger.log(f'{tag} Epoch {epoch:03d} | Train Loss {(run_loss/max(total,1)):.4f} | Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
 
 
-@torch.no_grad()
 def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[float, float]:
     """Evaluate clean and adversarial accuracy with the provided (image-space) attack."""
     model.eval()
@@ -248,6 +247,7 @@ def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[fl
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
 
+        # Clean accuracy evaluation
         with torch.no_grad():
             logits = model(x)
             clean_correct += (logits.argmax(1) == y).sum().item()
@@ -257,7 +257,7 @@ def eval_clean_and_adv(model: nn.Module, loader: DataLoader, attack) -> Tuple[fl
         x_adv, _ = attack.perturb(x, y)
         with torch.no_grad():
             logits_adv = model(x_adv)
-        adv_correct += (logits_adv.argmax(1) == y).sum().item()
+            adv_correct += (logits_adv.argmax(1) == y).sum().item()
 
         total += y.size(0)
 
