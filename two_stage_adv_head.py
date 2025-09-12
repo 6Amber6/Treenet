@@ -135,8 +135,12 @@ def build_filtered_loader(data_dir, keep_labels, batch_size, train, num_workers=
 # ------------------------------------------------
 def train_clean_classifier(model, train_loader, test_loader, epochs, lr, logger, tag):
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[35, 45], gamma=0.1)
+    # Adjust milestones based on total epochs
+    milestone1 = max(epochs // 2, 1)
+    milestone2 = max(epochs * 3 // 4, 1)
+    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[milestone1, milestone2], gamma=0.1)
     ce = nn.CrossEntropyLoss()
+    
     for ep in range(1, epochs+1):
         model.train()
         seen, correct, loss_sum = 0, 0, 0.0
@@ -151,8 +155,10 @@ def train_clean_classifier(model, train_loader, test_loader, epochs, lr, logger,
             loss_sum += float(loss.item()) * x.size(0)
             correct += (logits.argmax(1) == y).sum().item()
             seen += y.size(0)
-        # Move scheduler.step() after the training loop
+        
+        # Step scheduler after each epoch
         sch.step()
+        
         if ep % 5 == 0 or ep == 1:
             acc = eval_clean(model, test_loader)
             logger.log(f'{tag} Epoch {ep:03d} | Train Loss {(loss_sum/max(seen,1)):.4f} | '
@@ -304,7 +310,7 @@ def main():
     m2_test_loader  = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=getattr(args, 'workers', 4))
 
     # Stage 1: clean training for submodels - use more epochs for better features
-    min_epochs_m = max(args.epochs_m, 30)  # At least 30 epochs for good features
+    min_epochs_m = max(args.epochs_m, 50)  # At least 50 epochs for good features
     logger.log(f"Training M1 (6-class) for {min_epochs_m} epochs (CE)...")
     m1 = build_lightresnet20(num_classes=len(animal_classes))
     train_clean_classifier(m1, m1_train_loader, m1_test_loader, min_epochs_m, args.lr_m, logger, '[M1]')
@@ -313,8 +319,24 @@ def main():
     m2 = build_lightresnet20(num_classes=len(vehicle_classes))
     train_clean_classifier(m2, m2_train_loader, m2_test_loader, min_epochs_m, args.lr_m, logger, '[M2]')
 
-    logger.log(f'[M1] Clean Test Acc: {eval_clean(m1, m1_test_loader):.4f}')
-    logger.log(f'[M2] Clean Test Acc: {eval_clean(m2, m2_test_loader):.4f}')
+    m1_acc = eval_clean(m1, m1_test_loader)
+    m2_acc = eval_clean(m2, m2_test_loader)
+    logger.log(f'[M1] Clean Test Acc: {m1_acc:.4f}')
+    logger.log(f'[M2] Clean Test Acc: {m2_acc:.4f}')
+    
+    # If M1 accuracy is too low, train more
+    if m1_acc < 0.80:
+        logger.log(f"M1 accuracy {m1_acc:.4f} is too low, training for additional 20 epochs...")
+        train_clean_classifier(m1, m1_train_loader, m1_test_loader, 20, args.lr_m * 0.1, logger, '[M1-extra]')
+        m1_acc = eval_clean(m1, m1_test_loader)
+        logger.log(f'[M1] Updated Clean Test Acc: {m1_acc:.4f}')
+    
+    # If M2 accuracy is too low, train more
+    if m2_acc < 0.85:
+        logger.log(f"M2 accuracy {m2_acc:.4f} is too low, training for additional 20 epochs...")
+        train_clean_classifier(m2, m2_train_loader, m2_test_loader, 20, args.lr_m * 0.1, logger, '[M2-extra]')
+        m2_acc = eval_clean(m2, m2_test_loader)
+        logger.log(f'[M2] Updated Clean Test Acc: {m2_acc:.4f}')
 
     # Stage 2: adversarially train ONLY the head G
     head = HeadG(in_dim=128, num_classes=10).to(DEVICE)
@@ -328,38 +350,28 @@ def main():
     args_pretrain.epochs_g = 5
     train_head_adversarial(fusion, full_train_loader, full_test_loader, args_pretrain, logger)
 
-    # Progressive adversarial training: start gentle, increase strength
-    logger.log("Progressive adversarial training strategy:")
+    # Conservative adversarial training: focus on maintaining clean accuracy
+    logger.log("Conservative adversarial training strategy:")
     
-    # Phase 1: Very gentle attacks
+    # Phase 1: Very gentle attacks - focus on building robustness
     args_phase1 = argparse.Namespace(**vars(args))
-    args_phase1.attack_eps = 2/255  # Very gentle
-    args_phase1.attack_step = 0.5/255
-    args_phase1.attack_iter = 3
-    args_phase1.epochs_g = max(1, args.epochs_g // 3)
+    args_phase1.attack_eps = 1/255  # Very gentle
+    args_phase1.attack_step = 0.25/255
+    args_phase1.attack_iter = 2
+    args_phase1.epochs_g = max(1, args.epochs_g // 2)
     
-    logger.log(f"Phase 1: Gentle attacks (eps={args_phase1.attack_eps:.6f}) for {args_phase1.epochs_g} epochs")
+    logger.log(f"Phase 1: Very gentle attacks (eps={args_phase1.attack_eps:.6f}) for {args_phase1.epochs_g} epochs")
     train_head_adversarial(fusion, full_train_loader, full_test_loader, args_phase1, logger)
     
-    # Phase 2: Medium attacks
+    # Phase 2: Slightly stronger attacks
     args_phase2 = argparse.Namespace(**vars(args))
-    args_phase2.attack_eps = 4/255  # Medium
-    args_phase2.attack_step = 1/255
-    args_phase2.attack_iter = 5
-    args_phase2.epochs_g = max(1, args.epochs_g // 3)
+    args_phase2.attack_eps = 2/255  # Still gentle
+    args_phase2.attack_step = 0.5/255
+    args_phase2.attack_iter = 3
+    args_phase2.epochs_g = args.epochs_g - args_phase1.epochs_g
     
-    logger.log(f"Phase 2: Medium attacks (eps={args_phase2.attack_eps:.6f}) for {args_phase2.epochs_g} epochs")
+    logger.log(f"Phase 2: Gentle attacks (eps={args_phase2.attack_eps:.6f}) for {args_phase2.epochs_g} epochs")
     train_head_adversarial(fusion, full_train_loader, full_test_loader, args_phase2, logger)
-    
-    # Phase 3: Full strength attacks
-    args_phase3 = argparse.Namespace(**vars(args))
-    args_phase3.attack_eps = min(args.attack_eps, 6/255)  # Full strength but capped
-    args_phase3.attack_step = min(args.attack_step, 1.5/255)
-    args_phase3.attack_iter = min(args.attack_iter, 7)
-    args_phase3.epochs_g = args.epochs_g - args_phase1.epochs_g - args_phase2.epochs_g
-    
-    logger.log(f"Phase 3: Full attacks (eps={args_phase3.attack_eps:.6f}) for {args_phase3.epochs_g} epochs")
-    train_head_adversarial(fusion, full_train_loader, full_test_loader, args_phase3, logger)
 
     clean_g = eval_clean(fusion, full_test_loader)
     adv_g   = eval_adv(fusion, full_test_loader, make_eval_attack(fusion, args))
