@@ -14,6 +14,7 @@ import os
 import sys
 import json
 import shutil
+import argparse
 from typing import List, Tuple
 
 import torch
@@ -55,6 +56,16 @@ class HeadG(nn.Module):
             nn.Dropout(0.1),
             nn.Linear(256, num_classes),
         )
+        # Initialize weights properly
+        self._init_weights()
+    
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+    
     def forward(self, x):
         return self.net(x)
 
@@ -140,6 +151,7 @@ def train_clean_classifier(model, train_loader, test_loader, epochs, lr, logger,
             loss_sum += float(loss.item()) * x.size(0)
             correct += (logits.argmax(1) == y).sum().item()
             seen += y.size(0)
+        # Move scheduler.step() after the training loop
         sch.step()
         if ep % 5 == 0 or ep == 1:
             acc = eval_clean(model, test_loader)
@@ -188,8 +200,9 @@ def train_head_adversarial(fusion: FusionHead,
     # keep frozen backbones in eval mode (no BN update)
     fusion.m1.eval(); fusion.m2.eval()
 
-    # only G is trainable
-    opt = torch.optim.Adam(fusion.head.parameters(), lr=args.lr, weight_decay=1e-4)
+    # only G is trainable - use lower LR for head training
+    head_lr = min(args.lr, 1e-3)  # Cap at 1e-3 for stability
+    opt = torch.optim.Adam(fusion.head.parameters(), lr=head_lr, weight_decay=1e-4)
     sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[35, 45], gamma=0.1)
     ce = nn.CrossEntropyLoss()
     eval_atk = make_eval_attack(fusion, args)
@@ -203,6 +216,7 @@ def train_head_adversarial(fusion: FusionHead,
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
+                # TRADES handles optimizer steps internally
                 loss_all = trades_loss(
                     fusion, x, y, optimizer=opt,
                     beta=args.beta,
@@ -212,6 +226,7 @@ def train_head_adversarial(fusion: FusionHead,
                 )
                 loss_main = loss_all[0] if isinstance(loss_all, (tuple, list)) else loss_all
             elif args.trainer == 'mart':
+                # MART handles optimizer steps internally
                 loss_all = mart_loss(
                     fusion, x, y, optimizer=opt,
                     beta=args.beta,
@@ -221,6 +236,7 @@ def train_head_adversarial(fusion: FusionHead,
                 )
                 loss_main = loss_all[0] if isinstance(loss_all, (tuple, list)) else loss_all
             else:
+                # Standard CE training
                 opt.zero_grad(set_to_none=True)
                 logits = fusion(x)
                 loss_main = ce(logits, y)
@@ -235,6 +251,7 @@ def train_head_adversarial(fusion: FusionHead,
                 correct += (preds == y).sum().item()
                 seen += y.size(0)
 
+        # Move scheduler.step() after the training loop
         sch.step()
 
         if ep % 5 == 0 or ep == 1:
@@ -297,7 +314,17 @@ def main():
     fusion = FusionHead(m1, m2, head).to(DEVICE)
     fusion.m1.eval(); fusion.m2.eval()
 
+    # Pre-train head with clean data for a few epochs to initialize properly
+    logger.log("Pre-training head G with clean data for 5 epochs...")
+    args_pretrain = argparse.Namespace(**vars(args))
+    args_pretrain.trainer = 'ce'
+    args_pretrain.epochs_g = 5
+    train_head_adversarial(fusion, full_train_loader, full_test_loader, args_pretrain, logger)
+
     logger.log(f"Adversarial training G with {args.trainer.upper()} for {args.epochs_g} epochs ...")
+    logger.log(f"Head learning rate: {min(args.lr, 1e-3):.6f}")
+    logger.log(f"Beta (TRADES): {args.beta}")
+    logger.log(f"Attack eps: {args.attack_eps:.6f}, step: {args.attack_step:.6f}, iter: {args.attack_iter}")
     # IMPORTANT: we use args.lr (defined by parser_train) for the head optimizer LR
     train_head_adversarial(fusion, full_train_loader, full_test_loader, args, logger)
 
