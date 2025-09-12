@@ -212,6 +212,8 @@ def train_head_adversarial(fusion: FusionHead,
         fusion.m1.eval(); fusion.m2.eval()  # ensure backbones remain eval
 
         seen, correct, loss_sum = 0, 0, 0.0
+        did_step = False  # Track if optimizer step was performed
+        
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
 
@@ -225,6 +227,7 @@ def train_head_adversarial(fusion: FusionHead,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_all[0] if isinstance(loss_all, (tuple, list)) else loss_all
+                did_step = True
             elif args.trainer == 'mart':
                 # MART handles optimizer steps internally
                 loss_all = mart_loss(
@@ -235,6 +238,7 @@ def train_head_adversarial(fusion: FusionHead,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_all[0] if isinstance(loss_all, (tuple, list)) else loss_all
+                did_step = True
             else:
                 # Standard CE training
                 opt.zero_grad(set_to_none=True)
@@ -243,6 +247,7 @@ def train_head_adversarial(fusion: FusionHead,
                 loss_main.backward()
                 torch.nn.utils.clip_grad_norm_(fusion.head.parameters(), 5.0)
                 opt.step()
+                did_step = True
 
             loss_sum += float(loss_main.detach().item()) * x.size(0)
 
@@ -251,8 +256,9 @@ def train_head_adversarial(fusion: FusionHead,
                 correct += (preds == y).sum().item()
                 seen += y.size(0)
 
-        # Move scheduler.step() after the training loop
-        sch.step()
+        # Only step scheduler if optimizer was stepped
+        if did_step:
+            sch.step()
 
         if ep % 5 == 0 or ep == 1:
             clean_acc = eval_clean(fusion, test_loader)
@@ -297,14 +303,15 @@ def main():
     m2_train_loader = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=getattr(args, 'workers', 4))
     m2_test_loader  = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=getattr(args, 'workers', 4))
 
-    # Stage 1: clean training for submodels
-    logger.log(f"Training M1 (6-class) for {args.epochs_m} epochs (CE)...")
+    # Stage 1: clean training for submodels - use more epochs for better features
+    min_epochs_m = max(args.epochs_m, 30)  # At least 30 epochs for good features
+    logger.log(f"Training M1 (6-class) for {min_epochs_m} epochs (CE)...")
     m1 = build_lightresnet20(num_classes=len(animal_classes))
-    train_clean_classifier(m1, m1_train_loader, m1_test_loader, args.epochs_m, args.lr_m, logger, '[M1]')
+    train_clean_classifier(m1, m1_train_loader, m1_test_loader, min_epochs_m, args.lr_m, logger, '[M1]')
 
-    logger.log(f"Training M2 (4-class) for {args.epochs_m} epochs (CE)...")
+    logger.log(f"Training M2 (4-class) for {min_epochs_m} epochs (CE)...")
     m2 = build_lightresnet20(num_classes=len(vehicle_classes))
-    train_clean_classifier(m2, m2_train_loader, m2_test_loader, args.epochs_m, args.lr_m, logger, '[M2]')
+    train_clean_classifier(m2, m2_train_loader, m2_test_loader, min_epochs_m, args.lr_m, logger, '[M2]')
 
     logger.log(f'[M1] Clean Test Acc: {eval_clean(m1, m1_test_loader):.4f}')
     logger.log(f'[M2] Clean Test Acc: {eval_clean(m2, m2_test_loader):.4f}')
@@ -321,12 +328,38 @@ def main():
     args_pretrain.epochs_g = 5
     train_head_adversarial(fusion, full_train_loader, full_test_loader, args_pretrain, logger)
 
-    logger.log(f"Adversarial training G with {args.trainer.upper()} for {args.epochs_g} epochs ...")
-    logger.log(f"Head learning rate: {min(args.lr, 1e-3):.6f}")
-    logger.log(f"Beta (TRADES): {args.beta}")
-    logger.log(f"Attack eps: {args.attack_eps:.6f}, step: {args.attack_step:.6f}, iter: {args.attack_iter}")
-    # IMPORTANT: we use args.lr (defined by parser_train) for the head optimizer LR
-    train_head_adversarial(fusion, full_train_loader, full_test_loader, args, logger)
+    # Progressive adversarial training: start gentle, increase strength
+    logger.log("Progressive adversarial training strategy:")
+    
+    # Phase 1: Very gentle attacks
+    args_phase1 = argparse.Namespace(**vars(args))
+    args_phase1.attack_eps = 2/255  # Very gentle
+    args_phase1.attack_step = 0.5/255
+    args_phase1.attack_iter = 3
+    args_phase1.epochs_g = max(1, args.epochs_g // 3)
+    
+    logger.log(f"Phase 1: Gentle attacks (eps={args_phase1.attack_eps:.6f}) for {args_phase1.epochs_g} epochs")
+    train_head_adversarial(fusion, full_train_loader, full_test_loader, args_phase1, logger)
+    
+    # Phase 2: Medium attacks
+    args_phase2 = argparse.Namespace(**vars(args))
+    args_phase2.attack_eps = 4/255  # Medium
+    args_phase2.attack_step = 1/255
+    args_phase2.attack_iter = 5
+    args_phase2.epochs_g = max(1, args.epochs_g // 3)
+    
+    logger.log(f"Phase 2: Medium attacks (eps={args_phase2.attack_eps:.6f}) for {args_phase2.epochs_g} epochs")
+    train_head_adversarial(fusion, full_train_loader, full_test_loader, args_phase2, logger)
+    
+    # Phase 3: Full strength attacks
+    args_phase3 = argparse.Namespace(**vars(args))
+    args_phase3.attack_eps = min(args.attack_eps, 6/255)  # Full strength but capped
+    args_phase3.attack_step = min(args.attack_step, 1.5/255)
+    args_phase3.attack_iter = min(args.attack_iter, 7)
+    args_phase3.epochs_g = args.epochs_g - args_phase1.epochs_g - args_phase2.epochs_g
+    
+    logger.log(f"Phase 3: Full attacks (eps={args_phase3.attack_eps:.6f}) for {args_phase3.epochs_g} epochs")
+    train_head_adversarial(fusion, full_train_loader, full_test_loader, args_phase3, logger)
 
     clean_g = eval_clean(fusion, full_test_loader)
     adv_g   = eval_adv(fusion, full_test_loader, make_eval_attack(fusion, args))
