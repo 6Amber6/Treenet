@@ -303,7 +303,7 @@ def train_fusion_adversarial_A(fusion: FusionHead,
                 # EXPLICIT update: zero_grad -> loss.backward -> step
                 opt.zero_grad(set_to_none=True)
                 loss_val = trades_loss(
-                    fusion, x, y,
+                    fusion, x, y, optimizer=opt,
                     beta=args.beta,
                     step_size=getattr(args, 'attack_step', 2/255),
                     epsilon=getattr(args, 'attack_eps', 8/255),
@@ -320,7 +320,7 @@ def train_fusion_adversarial_A(fusion: FusionHead,
             elif args.trainer == 'mart':
                 opt.zero_grad(set_to_none=True)
                 loss_val = mart_loss(
-                    fusion, x, y,
+                    fusion, x, y, optimizer=opt,
                     beta=args.beta,
                     step_size=getattr(args, 'attack_step', 2/255),
                     epsilon=getattr(args, 'attack_eps', 8/255),
