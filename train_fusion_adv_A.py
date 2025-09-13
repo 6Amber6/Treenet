@@ -358,7 +358,6 @@ def main():
     parse.add_argument('--lr-m', type=float, default=0.1, help='LR for M1/M2 clean training')
     parse.add_argument('--trainer', type=str, default='trades', choices=['trades', 'mart', 'ce'],
                        help='objective for fusion stage (trades/mart/ce)')
-    parse.add_argument('--desc', type=str, default='fusion_A_partial_unfreeze', help='log dir name')
 
     args = parse.parse_args()
 
