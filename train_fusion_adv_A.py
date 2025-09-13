@@ -289,37 +289,53 @@ def train_fusion_adversarial_A(fusion: FusionHead,
 
     for ep in range(1, args.epochs_g + 1):
         fusion.train()
-        # Ensure only the last stages are in train() mode
+        # ensure only the last stages are in train() mode
         get_last_stage(fusion.m1).train()
         get_last_stage(fusion.m2).train()
 
         seen, correct, loss_sum = 0, 0, 0.0
+        did_update = False
 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
+                # EXPLICIT update: zero_grad -> loss.backward -> step
+                opt.zero_grad(set_to_none=True)
                 loss_val = trades_loss(
-                    fusion, x, y, optimizer=opt,
+                    fusion, x, y,
                     beta=args.beta,
                     step_size=getattr(args, 'attack_step', 2/255),
                     epsilon=getattr(args, 'attack_eps', 8/255),
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_val[0] if isinstance(loss_val, (tuple, list)) else loss_val
+                loss_main.backward()
+                torch.nn.utils.clip_grad_norm_(fusion.head.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m1).parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m2).parameters(), 5.0)
+                opt.step()
+                did_update = True
 
             elif args.trainer == 'mart':
+                opt.zero_grad(set_to_none=True)
                 loss_val = mart_loss(
-                    fusion, x, y, optimizer=opt,
+                    fusion, x, y,
                     beta=args.beta,
                     step_size=getattr(args, 'attack_step', 2/255),
                     epsilon=getattr(args, 'attack_eps', 8/255),
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_val[0] if isinstance(loss_val, (tuple, list)) else loss_val
+                loss_main.backward()
+                torch.nn.utils.clip_grad_norm_(fusion.head.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m1).parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m2).parameters(), 5.0)
+                opt.step()
+                did_update = True
 
             else:
-                # CE warmup branch
+                # CE warmup branch (already correct)
                 opt.zero_grad(set_to_none=True)
                 logits = fusion(x)
                 loss_main = ce(logits, y)
@@ -328,6 +344,7 @@ def train_fusion_adversarial_A(fusion: FusionHead,
                 torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m1).parameters(), 5.0)
                 torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m2).parameters(), 5.0)
                 opt.step()
+                did_update = True
 
             loss_sum += float(loss_main.detach().item()) * x.size(0)
 
@@ -336,7 +353,9 @@ def train_fusion_adversarial_A(fusion: FusionHead,
                 correct += (preds == y).sum().item()
                 seen += y.size(0)
 
-        sch.step()
+        # step LR only if we actually updated this epoch
+        if did_update:
+            sch.step()
 
         if ep % 5 == 0 or ep == 1:
             clean_acc = eval_clean(fusion, test_loader)
