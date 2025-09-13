@@ -7,11 +7,11 @@ Pipeline:
   2) Train M2 (4-class vehicles) with CE (clean only)
   3) Build Fusion model:
       x -> M1(x) -> 6-class logits
-      x -> M2(x) -> 4-class logits  
+      x -> M2(x) -> 4-class logits
       x -> [penult(M1(x)) || penult(M2(x))] -> HeadG(10) -> 10-class logits
   4) Train ALL components (M1 + M2 + HeadG) with TRADES/MART
      - ALL parameters participate in delta gradient computation
-     - Multi-task loss: CE(M1) + CE(M2) + CE(HeadG)
+     - Loss focuses on 10-class fusion logits (optionally extend to multi-task with proper masking)
 """
 
 import os
@@ -19,7 +19,7 @@ import sys
 import json
 import shutil
 import argparse
-from typing import List
+from typing import List, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -37,7 +37,7 @@ if ARP_ROOT not in sys.path:
 from core.models.resnet import LightResnet, BasicBlock
 from core.utils import Logger, parser_train, seed
 from core.attacks import create_attack
-from core.utils.trades import trades_loss
+from core.utils.trades import trades_loss  # keep imported, though we use custom_trades_loss by default
 from core.utils.mart import mart_loss
 from core import animal_classes, vehicle_classes
 
@@ -78,40 +78,52 @@ class FullFusionModel(nn.Module):
     """
     Full fusion model where ALL components participate in adversarial training:
     - M1: 6-class animal classifier
-    - M2: 4-class vehicle classifier  
+    - M2: 4-class vehicle classifier
     - HeadG: 10-class fusion classifier
-    ALL parameters are trainable and participate in delta gradient computation.
     """
     def __init__(self, m1: LightResnet, m2: LightResnet, head: HeadG):
         super().__init__()
-        self.m1 = m1  # 6-class animal classifier
-        self.m2 = m2  # 4-class vehicle classifier
-        self.head = head  # 10-class fusion classifier
-        
+        self.m1 = m1
+        self.m2 = m2
+        self.head = head
+
         # Forward hooks to capture penultimate features
         self._feats = {}
         self._h1 = self.m1.fc.register_forward_hook(lambda m, inp, out: self._save_feat("m1", inp))
         self._h2 = self.m2.fc.register_forward_hook(lambda m, inp, out: self._save_feat("m2", inp))
 
     def _save_feat(self, key, inp_tuple):
+        # inp_tuple[0] shape: [B, D] = features BEFORE final fc
         self._feats[key] = inp_tuple[0]
 
     def forward(self, x):
-        # M1 forward pass (6-class)
+        # 6-class and 4-class branches
         m1_logits = self.m1(x)
-        
-        # M2 forward pass (4-class)  
         m2_logits = self.m2(x)
-        
-        # Fusion forward pass (10-class)
+        # Fusion (10-class)
         z = torch.cat([self._feats["m1"], self._feats["m2"]], dim=1)
         fusion_logits = self.head(z)
-        
         return m1_logits, m2_logits, fusion_logits
 
     def remove_hooks(self):
         self._h1.remove()
         self._h2.remove()
+
+
+class LogitsOnlyWrapper(nn.Module):
+    """
+    Adapter that forces model(x) to return a single logits tensor.
+    If the underlying model returns a tuple/list, we take the last element.
+    """
+    def __init__(self, base: nn.Module):
+        super().__init__()
+        self.base = base
+
+    def forward(self, x):
+        out = self.base(x)
+        if isinstance(out, (tuple, list)):
+            return out[-1]
+        return out
 
 
 # ------------------------------------------------
@@ -192,113 +204,113 @@ def train_clean_classifier(model, train_loader, test_loader, epochs, lr, logger,
 
 @torch.no_grad()
 def eval_clean(model, loader) -> float:
-    model.eval()
+    """
+    Evaluate on clean data. Works for both plain models and FullFusionModel (tuple output).
+    """
+    model_logits = LogitsOnlyWrapper(model)
+    model_logits.eval()
     tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        logits = model(x)
+        logits = model_logits(x)
         correct += (logits.argmax(1) == y).sum().item()
         tot += y.size(0)
     return correct / max(tot, 1)
 
 
 def make_eval_attack(model, args):
-    """Build the unified evaluation attack from args."""
+    """
+    Build the unified evaluation attack from args.
+    Ensure the attack sees ONLY the final (10-class) logits even if the base model returns a tuple.
+    """
     crit = nn.CrossEntropyLoss()
-    attack = getattr(args, 'attack', 'linf-pgd')
     eps = getattr(args, 'attack_eps', 8/255)
     step = getattr(args, 'attack_step', 2/255)
     iters = getattr(args, 'attack_iter', 10)
-    return create_attack(model, crit, attack, eps, iters, step)
+    attack_name = getattr(args, 'attack', 'linf-pgd')
+
+    model_for_attack = LogitsOnlyWrapper(model)  # important!
+    return create_attack(model_for_attack, crit, attack_name, eps, iters, step)
 
 
 def eval_adv(model, loader, attack) -> float:
-    model.eval()
+    """
+    Adversarial evaluation: craft x_adv with the attack's internal model (already logits-only),
+    then compute accuracy with the base model's fusion logits.
+    """
+    model_logits = LogitsOnlyWrapper(model)  # for accuracy calc
+    model_logits.eval()
     tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        # Do NOT wrap in no_grad: attack needs gradients internally
+        # Attack uses its own reference to the logits-only wrapper passed at creation time
         x_adv, _ = attack.perturb(x, y)
         with torch.no_grad():
-            m1_logits, m2_logits, fusion_logits = model(x_adv)
-        correct += (fusion_logits.argmax(1) == y).sum().item()
+            logits = model_logits(x_adv)
+        correct += (logits.argmax(1) == y).sum().item()
         tot += y.size(0)
     return correct / max(tot, 1)
 
 
-def custom_trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, perturb_steps=10, beta=1.0):
+def custom_trades_loss(model, x_natural, y, optimizer,
+                       step_size=0.003, epsilon=0.031, perturb_steps=10, beta=6.0):
     """
-    Custom TRADES loss that includes ALL components (M1 + M2 + HeadG).
-    ALL parameters participate in delta gradient computation.
+    TRADES-like loss on the final fusion logits.
+    All parameters (M1, M2, HeadG) are trainable; delta is generated through the whole model.
     """
     import torch.nn.functional as F
-    from torch.autograd import Variable
-    
-    # Define KL-loss
+
+    # We'll operate on logits-only wrapper for stable KL on fusion head
+    model_logits = LogitsOnlyWrapper(model)
     criterion_kl = nn.KLDivLoss(reduction='sum')
-    model.eval()
-    batch_size = len(x_natural)
-    
-    # Generate adversarial example
-    x_adv = x_natural.detach() + 0.001 * torch.randn_like(x_natural).to(x_natural.device).detach()
-    
-    # Get natural predictions for all components
-    m1_nat, m2_nat, fusion_nat = model(x_natural)
-    p_natural = F.softmax(fusion_nat, dim=1)  # Use fusion for KL divergence
-    
-    # PGD attack on fusion model
+    batch_size = x_natural.size(0)
+
+    # PGD on eval() to freeze BN running stats during delta generation
+    model_logits.eval()
+
+    # small random start
+    x_adv = x_natural.detach() + 0.001 * torch.randn_like(x_natural, device=x_natural.device)
+    x_adv = torch.clamp(x_adv, 0.0, 1.0)
+
+    with torch.no_grad():
+        p_natural = F.softmax(model_logits(x_natural), dim=1)
+
     for _ in range(perturb_steps):
-        x_adv.requires_grad_()
-        with torch.enable_grad():
-            m1_adv, m2_adv, fusion_adv = model(x_adv)
-            loss_kl = criterion_kl(F.log_softmax(fusion_adv, dim=1), p_natural)
-        grad = torch.autograd.grad(loss_kl, [x_adv])[0]
+        x_adv.requires_grad_(True)
+        logits_adv = model_logits(x_adv)
+        loss_kl = criterion_kl(F.log_softmax(logits_adv, dim=1), p_natural)
+        grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True)[0]
         x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
         x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
         x_adv = torch.clamp(x_adv, 0.0, 1.0)
-    
+
+    # Switch back to train() for parameter updates
     model.train()
-    x_adv = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
-    
-    optimizer.zero_grad()
-    
-    # Calculate losses for all components
-    m1_nat, m2_nat, fusion_nat = model(x_natural)
-    m1_adv, m2_adv, fusion_adv = model(x_adv)
-    
-    # Natural losses
-    loss_m1_nat = F.cross_entropy(m1_nat, y)
-    loss_m2_nat = F.cross_entropy(m2_nat, y) 
-    loss_fusion_nat = F.cross_entropy(fusion_nat, y)
-    
-    # Robust loss (KL divergence)
-    loss_robust = (1.0 / batch_size) * criterion_kl(F.log_softmax(fusion_adv, dim=1),
-                                                    F.softmax(fusion_nat, dim=1))
-    
-    # Total loss: natural + robust
-    loss = loss_fusion_nat + beta * loss_robust
-    
-    # Optional: add M1/M2 losses for multi-task learning
-    # loss = loss + 0.1 * loss_m1_nat + 0.1 * loss_m2_nat
-    
+    optimizer.zero_grad(set_to_none=True)
+
+    logits_nat = model_logits(x_natural)
+    logits_adv = model_logits(x_adv)
+
+    # Natural CE on fusion logits + robust KL
+    loss_nat = F.cross_entropy(logits_nat, y)
+    loss_robust = (1.0 / batch_size) * criterion_kl(
+        F.log_softmax(logits_adv, dim=1), F.softmax(logits_nat, dim=1)
+    )
+    loss = loss_nat + beta * loss_robust
+
     loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
     optimizer.step()
-    
-    return loss, {
-        'loss': loss.item(),
-        'clean_acc': (fusion_nat.argmax(1) == y).float().mean().item(),
-        'adversarial_acc': (fusion_adv.argmax(1) == y).float().mean().item()
-    }
+
+    return loss
 
 
 def train_full_fusion_adversarial(fusion_model: FullFusionModel,
-                                 train_loader, test_loader,
-                                 args, logger):
+                                  train_loader, test_loader,
+                                  args, logger):
     """
-    Train ALL components (M1 + M2 + HeadG) with TRADES/MART.
-    ALL parameters participate in delta gradient computation.
+    Train ALL components (M1 + M2 + HeadG) with TRADES/MART (default: custom TRADES).
     """
-    # ALL parameters are trainable
     opt = torch.optim.SGD(fusion_model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
     sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[35, 45], gamma=0.1)
     ce = nn.CrossEntropyLoss()
@@ -312,31 +324,28 @@ def train_full_fusion_adversarial(fusion_model: FullFusionModel,
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                # Custom TRADES that includes ALL components
-                loss_val, batch_metrics = custom_trades_loss(
+                loss_main = custom_trades_loss(
                     fusion_model, x, y, optimizer=opt,
                     beta=args.beta,
                     step_size=getattr(args, 'attack_step', 2/255),
                     epsilon=getattr(args, 'attack_eps', 8/255),
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
-                loss_main = loss_val
-
             elif args.trainer == 'mart':
-                # Use repo's MART (it will work with our model)
+                # If you want to use repo MART directly, it expects model(x)->logits.
+                # Wrap on-the-fly:
                 loss_val = mart_loss(
-                    fusion_model, x, y, optimizer=opt,
+                    LogitsOnlyWrapper(fusion_model), x, y, optimizer=opt,
                     beta=args.beta,
                     step_size=getattr(args, 'attack_step', 2/255),
                     epsilon=getattr(args, 'attack_eps', 8/255),
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_val[0] if isinstance(loss_val, (tuple, list)) else loss_val
-
             else:
-                # CE training: explicit backward/step
+                # CE warmup on fusion logits only
                 opt.zero_grad(set_to_none=True)
-                m1_logits, m2_logits, fusion_logits = fusion_model(x)
+                fusion_logits = LogitsOnlyWrapper(fusion_model)(x)
                 loss_main = ce(fusion_logits, y)
                 loss_main.backward()
                 torch.nn.utils.clip_grad_norm_(fusion_model.parameters(), 5.0)
@@ -345,8 +354,8 @@ def train_full_fusion_adversarial(fusion_model: FullFusionModel,
             loss_sum += float(loss_main.detach().item()) * x.size(0)
 
             with torch.no_grad():
-                m1_logits, m2_logits, fusion_logits = fusion_model(x)
-                correct += (fusion_logits.argmax(1) == y).sum().item()
+                fusion_logits_clean = LogitsOnlyWrapper(fusion_model)(x)
+                correct += (fusion_logits_clean.argmax(1) == y).sum().item()
                 seen += y.size(0)
 
         sch.step()
@@ -439,7 +448,7 @@ def main():
 
     # Build full fusion model (ALL parameters trainable)
     fusion_model = FullFusionModel(m1, m2, head).to(DEVICE)
-    logger.log(f'Full fusion model: ALL parameters trainable')
+    logger.log('Full fusion model: ALL parameters trainable')
     logger.log(f'Total trainable parameters: {sum(p.numel() for p in fusion_model.parameters() if p.requires_grad)}')
 
     # Short CE warmup for full fusion
