@@ -414,7 +414,7 @@ def main():
         logger.log(f'[M2] Updated Clean Test Acc: {m2_acc:.4f}')
 
     # Stage 2: Fusion + Scheme A adversarial training (epsilon curriculum)
-    penult_dim = infer_penult_dim(m1, m2, full_train_loader)
+    penult_dim = int(m1.fc.in_features + m2.fc.in_features)
     logger.log(f'Inferred penultimate concat dim: {penult_dim}')
     head = HeadG(in_dim=penult_dim, num_classes=10).to(DEVICE)
 
