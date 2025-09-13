@@ -192,7 +192,7 @@ def eval_clean(model, loader) -> float:
 
 
 def make_eval_attack(model, args):
-    """Use unified evaluation attack. Defaults: PGD-10, eps=8/255, step=2/255."""
+    """Use unified evaluation attack. Defaults (from args): attack type/eps/step/iter come from parser_train."""
     crit = nn.CrossEntropyLoss()
     attack = getattr(args, 'attack', 'linf-pgd')
     eps = getattr(args, 'attack_eps', 8/255)
@@ -350,19 +350,14 @@ def train_fusion_adversarial_A(fusion: FusionHead,
 # Main
 # ------------------------------------------------
 def main():
-    # Reuse repo's parser_train (includes --lr, --beta, --attack*, --workers, --batch-size, etc.)
+    # Reuse repo's parser_train (already defines --attack, --attack_eps, --attack_step, --attack_iter, etc.)
     parse = parser_train()
-    # Add only new flags
+    # Add only NEW flags (avoid duplicates)
     parse.add_argument('--epochs-m', type=int, default=50, help='epochs for M1/M2 clean training')
     parse.add_argument('--epochs-g', type=int, default=50, help='epochs for fusion adversarial training')
     parse.add_argument('--lr-m', type=float, default=0.1, help='LR for M1/M2 clean training')
     parse.add_argument('--trainer', type=str, default='trades', choices=['trades', 'mart', 'ce'],
                        help='objective for fusion stage (trades/mart/ce)')
-    # Unify default attack config to CIFAR-10 common strength; can be overridden via CLI
-    parse.add_argument('--attack', type=str, default='linf-pgd')
-    parse.add_argument('--attack_eps', type=float, default=8/255)
-    parse.add_argument('--attack_step', type=float, default=2/255)
-    parse.add_argument('--attack_iter', type=int, default=10)
     parse.add_argument('--desc', type=str, default='fusion_A_partial_unfreeze', help='log dir name')
 
     args = parse.parse_args()
