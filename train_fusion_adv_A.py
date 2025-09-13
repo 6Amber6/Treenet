@@ -1,15 +1,16 @@
 # train_fusion_adv_A.py
 """
-Two-Stage CE (+ Adversarial Training with partial-unfreeze, TRADES/MART)
+Two-Stage CE + Adversarial Training (Scheme A, stronger capacity + epsilon curriculum)
 
 Pipeline
-  1) Train M1 (6-class animal) with CE (clean only)
-  2) Train M2 (4-class vehicle) with CE (clean only)
+  1) Train M1 (6-class animals) with CE (clean only)
+  2) Train M2 (4-class vehicles) with CE (clean only)
   3) Build Fusion model:
-       x -> [penult(M1(x)) || penult(M2(x))] -> HeadG -> logits (10-class)
-     - Freeze all of M1/M2 EXCEPT the last residual stage (partial unfreeze)
-     - Train {HeadG + last_stage(M1) + last_stage(M2)} with TRADES/MART
-  4) Report clean & adversarial accuracy of fusion model
+       x -> [penult(M1(x)) || penult(M2(x))] -> HeadG(10)
+     - Partially unfreeze the last TWO residual stages of M1/M2 (e.g., layer2+layer3 on LightResnet20)
+     - Train {HeadG + last two stages of M1 + last two stages of M2}
+       with TRADES/MART using an epsilon curriculum
+  4) Report clean & adversarial accuracy of Fusion
 """
 
 import os
@@ -75,7 +76,7 @@ class HeadG(nn.Module):
 class FusionHead(nn.Module):
     """
     x -> penult(M1(x)) || penult(M2(x)) -> HeadG -> logits
-    Note: do NOT wrap forward in no_grad so adversarial attacks can backprop to pixels.
+    Note: DO NOT use no_grad in forward; adversarial example generation needs gradients w.r.t. input.
     """
     def __init__(self, m1: LightResnet, m2: LightResnet, head: HeadG):
         super().__init__()
@@ -83,13 +84,13 @@ class FusionHead(nn.Module):
         self.m2 = m2
         self.head = head
 
-        # Forward hooks to capture the input of the final fc (penultimate features)
+        # Forward hooks to capture the input to final fc (penultimate features)
         self._feats = {}
         self._h1 = self.m1.fc.register_forward_hook(lambda m, inp, out: self._save_feat("m1", inp))
         self._h2 = self.m2.fc.register_forward_hook(lambda m, inp, out: self._save_feat("m2", inp))
 
     def _save_feat(self, key, inp_tuple):
-        # inp_tuple[0] shape: [B, D] = features before final fc
+        # inp_tuple[0] shape: [B, D] = features BEFORE final fc
         self._feats[key] = inp_tuple[0]
 
     def forward(self, x):
@@ -192,7 +193,7 @@ def eval_clean(model, loader) -> float:
 
 
 def make_eval_attack(model, args):
-    """Use unified evaluation attack. Defaults (from args): attack type/eps/step/iter come from parser_train."""
+    """Build the unified evaluation attack from args (attack type/eps/step/iter come from parser_train)."""
     crit = nn.CrossEntropyLoss()
     attack = getattr(args, 'attack', 'linf-pgd')
     eps = getattr(args, 'attack_eps', 8/255)
@@ -206,7 +207,7 @@ def eval_adv(model, loader, attack) -> float:
     tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        # Do NOT wrap in no_grad: attack needs gradients wrt x internally
+        # Do NOT wrap in no_grad: attack needs gradients internally
         x_adv, _ = attack.perturb(x, y)
         with torch.no_grad():
             logits = model(x_adv)
@@ -216,61 +217,46 @@ def eval_adv(model, loader, attack) -> float:
 
 
 # -------------------- Scheme A helpers --------------------
-def get_last_stage(model: nn.Module) -> nn.Module:
-    """Return the last residual stage. Tries layer4 -> layer3 -> layer2."""
-    for name in ['layer4', 'layer3', 'layer2']:
-        m = getattr(model, name, None)
-        if isinstance(m, nn.Module):
-            return m
-    raise AttributeError("Cannot find last residual stage (layer4/layer3/layer2) in LightResnet")
+def _get_stages(model: nn.Module):
+    """Return available residual stages in order."""
+    names = [n for n in ['layer1', 'layer2', 'layer3', 'layer4'] if hasattr(model, n)]
+    return [getattr(model, n) for n in names]
 
 
-def set_partial_unfreeze_and_modes(m1: nn.Module, m2: nn.Module):
-    """Freeze all params, then unfreeze only the last residual stage and set its mode to train()."""
+def set_partial_unfreeze_and_modes(m1: nn.Module, m2: nn.Module, depth: int = 2):
+    """
+    Freeze everything, then unfreeze the LAST `depth` stages (e.g., depth=2 -> layer2+layer3 for LightResnet20).
+    Trainable stages are set to train(); all earlier layers stay in eval() to keep BN frozen.
+    """
+    # Freeze all
     for p in m1.parameters(): p.requires_grad = False
     for p in m2.parameters(): p.requires_grad = False
     m1.eval(); m2.eval()
 
-    last1 = get_last_stage(m1)
-    last2 = get_last_stage(m2)
-    for p in last1.parameters(): p.requires_grad = True
-    for p in last2.parameters(): p.requires_grad = True
-    last1.train()
-    last2.train()
-    return last1, last2
+    s1 = _get_stages(m1)
+    s2 = _get_stages(m2)
+    train_s1 = s1[-depth:] if depth > 0 else []
+    train_s2 = s2[-depth:] if depth > 0 else []
+
+    # Unfreeze & set train() only for selected stages
+    for st in train_s1:
+        for p in st.parameters(): p.requires_grad = True
+        st.train()
+    for st in train_s2:
+        for p in st.parameters(): p.requires_grad = True
+        st.train()
+
+    return train_s1, train_s2
 
 
-@torch.no_grad()
-def infer_penult_dim(m1: nn.Module, m2: nn.Module, sample_loader: DataLoader) -> int:
-    """Infer penultimate concat feature dimension from a sample batch."""
-    feats = {}
-
-    def hk1(m, inp, out): feats['m1'] = inp[0]
-    def hk2(m, inp, out): feats['m2'] = inp[0]
-
-    h1 = m1.fc.register_forward_hook(hk1)
-    h2 = m2.fc.register_forward_hook(hk2)
-
-    x, _ = next(iter(sample_loader))
-    x = x.to(DEVICE)
-    _ = m1(x)
-    _ = m2(x)
-    h1.remove(); h2.remove()
-
-    assert 'm1' in feats and 'm2' in feats, "Failed to capture penultimate features"
-    d = feats['m1'].shape[1] + feats['m2'].shape[1]
-    return int(d)
-
-
-def build_optimizer_for_A(fusion: FusionHead, lr_head=1e-3, lr_stage=5e-4, weight_decay=5e-4):
-    """Optimizer for Scheme A: head + last stage of each submodel."""
-    last1 = get_last_stage(fusion.m1)
-    last2 = get_last_stage(fusion.m2)
-    params = [
-        {'params': fusion.head.parameters(), 'lr': lr_head},
-        {'params': last1.parameters(), 'lr': lr_stage},
-        {'params': last2.parameters(), 'lr': lr_stage},
-    ]
+def build_optimizer_for_A(fusion: FusionHead, train_stages, lr_head=1e-2, lr_stage=3e-3, weight_decay=5e-4):
+    """
+    Optimizer for Scheme A: head + (last two stages of each backbone).
+    Stronger LR on head (1e-2), moderate LR on stages (3e-3).
+    """
+    params = [{'params': fusion.head.parameters(), 'lr': lr_head}]
+    for st in train_stages:
+        params.append({'params': st.parameters(), 'lr': lr_stage})
     opt = torch.optim.SGD(params, momentum=0.9, weight_decay=weight_decay, nesterov=True)
     sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[35, 45], gamma=0.1)
     return opt, sch
@@ -278,30 +264,33 @@ def build_optimizer_for_A(fusion: FusionHead, lr_head=1e-3, lr_stage=5e-4, weigh
 
 def train_fusion_adversarial_A(fusion: FusionHead,
                                train_loader, test_loader,
-                               args, logger):
-    """Train head + last stages with TRADES/MART (or CE for warmup)."""
-    lr_head = min(args.lr, 1e-3)
-    lr_stage = min(args.lr * 0.5, 5e-4)
-    opt, sch = build_optimizer_for_A(fusion, lr_head=lr_head, lr_stage=lr_stage, weight_decay=5e-4)
+                               args, logger, train_stages=None):
+    """
+    Train head + selected stages with TRADES/MART or CE.
+    IMPORTANT: For TRADES/MART we pass optimizer to the repo's loss functions
+               and let THEM handle the backward/step (to match this repo's API).
+               For CE warmup we do explicit backward/step.
+    """
+    if train_stages is None:
+        train_stages = []
 
+    opt, sch = build_optimizer_for_A(fusion, train_stages, lr_head=1e-2, lr_stage=3e-3, weight_decay=5e-4)
     ce = nn.CrossEntropyLoss()
     eval_atk = make_eval_attack(fusion, args)
 
     for ep in range(1, args.epochs_g + 1):
         fusion.train()
-        # ensure only the last stages are in train() mode
-        get_last_stage(fusion.m1).train()
-        get_last_stage(fusion.m2).train()
+        # Ensure trainable stages are in train() (others stay eval())
+        for st in train_stages:
+            st.train()
 
         seen, correct, loss_sum = 0, 0, 0.0
-        did_update = False
 
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
 
             if args.trainer == 'trades':
-                # EXPLICIT update: zero_grad -> loss.backward -> step
-                opt.zero_grad(set_to_none=True)
+                # Let repo's TRADES handle backward/step; we only pass optimizer and hyperparameters
                 loss_val = trades_loss(
                     fusion, x, y, optimizer=opt,
                     beta=args.beta,
@@ -310,15 +299,8 @@ def train_fusion_adversarial_A(fusion: FusionHead,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_val[0] if isinstance(loss_val, (tuple, list)) else loss_val
-                loss_main.backward()
-                torch.nn.utils.clip_grad_norm_(fusion.head.parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m1).parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m2).parameters(), 5.0)
-                opt.step()
-                did_update = True
 
             elif args.trainer == 'mart':
-                opt.zero_grad(set_to_none=True)
                 loss_val = mart_loss(
                     fusion, x, y, optimizer=opt,
                     beta=args.beta,
@@ -327,24 +309,18 @@ def train_fusion_adversarial_A(fusion: FusionHead,
                     perturb_steps=getattr(args, 'attack_iter', 10),
                 )
                 loss_main = loss_val[0] if isinstance(loss_val, (tuple, list)) else loss_val
-                loss_main.backward()
-                torch.nn.utils.clip_grad_norm_(fusion.head.parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m1).parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m2).parameters(), 5.0)
-                opt.step()
-                did_update = True
 
             else:
-                # CE warmup branch (already correct)
+                # CE warmup: explicit backward/step
                 opt.zero_grad(set_to_none=True)
                 logits = fusion(x)
                 loss_main = ce(logits, y)
                 loss_main.backward()
+                # Clip only in CE branch (we don't control backward in TRADES/MART branches)
                 torch.nn.utils.clip_grad_norm_(fusion.head.parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m1).parameters(), 5.0)
-                torch.nn.utils.clip_grad_norm_(get_last_stage(fusion.m2).parameters(), 5.0)
+                for st in train_stages:
+                    torch.nn.utils.clip_grad_norm_(st.parameters(), 5.0)
                 opt.step()
-                did_update = True
 
             loss_sum += float(loss_main.detach().item()) * x.size(0)
 
@@ -353,9 +329,8 @@ def train_fusion_adversarial_A(fusion: FusionHead,
                 correct += (preds == y).sum().item()
                 seen += y.size(0)
 
-        # step LR only if we actually updated this epoch
-        if did_update:
-            sch.step()
+        # Step LR every epoch (there were optimizer steps inside TRADES/MART or above CE loop)
+        sch.step()
 
         if ep % 5 == 0 or ep == 1:
             clean_acc = eval_clean(fusion, test_loader)
@@ -369,11 +344,11 @@ def train_fusion_adversarial_A(fusion: FusionHead,
 # Main
 # ------------------------------------------------
 def main():
-    # Reuse repo's parser_train (already defines --attack, --attack_eps, --attack_step, --attack_iter, etc.)
+    # Reuse repo's parser_train (defines --data-dir/--log-dir/--desc/--data/--attack* etc.)
     parse = parser_train()
-    # Add only NEW flags (avoid duplicates)
+    # Add only NEW flags that don't already exist
     parse.add_argument('--epochs-m', type=int, default=50, help='epochs for M1/M2 clean training')
-    parse.add_argument('--epochs-g', type=int, default=50, help='epochs for fusion adversarial training')
+    parse.add_argument('--epochs-g', type=int, default=50, help='total epochs for fusion adversarial training')
     parse.add_argument('--lr-m', type=float, default=0.1, help='LR for M1/M2 clean training')
     parse.add_argument('--trainer', type=str, default='trades', choices=['trades', 'mart', 'ce'],
                        help='objective for fusion stage (trades/mart/ce)')
@@ -401,7 +376,7 @@ def main():
                                          num_workers=getattr(args, 'workers', 4),
                                          batch_size=args.batch_size)
 
-    # Filtered loaders
+    # Filtered loaders (6 animal classes / 4 vehicle classes)
     m1_train_loader = build_filtered_loader(DATA_DIR, animal_classes, args.batch_size, train=True,
                                             num_workers=getattr(args, 'workers', 4))
     m1_test_loader = build_filtered_loader(DATA_DIR, animal_classes, args.batch_size, train=False,
@@ -426,45 +401,68 @@ def main():
     logger.log(f'[M1] Clean Test Acc: {m1_acc:.4f}')
     logger.log(f'[M2] Clean Test Acc: {m2_acc:.4f}')
 
-    # Optional: extra fine-tuning if accuracy is low
     if m1_acc < 0.80:
-        logger.log(f"M1 acc {m1_acc:.4f} too low, +20 epochs fine-tune...")
+        logger.log(f"[M1] Acc {m1_acc:.4f} is low; fine-tuning +20 epochs @ lr*0.1...")
         train_clean_classifier(m1, m1_train_loader, m1_test_loader, 20, args.lr_m * 0.1, logger, '[M1-extra]')
         m1_acc = eval_clean(m1, m1_test_loader)
         logger.log(f'[M1] Updated Clean Test Acc: {m1_acc:.4f}')
 
     if m2_acc < 0.85:
-        logger.log(f"M2 acc {m2_acc:.4f} too low, +20 epochs fine-tune...")
+        logger.log(f"[M2] Acc {m2_acc:.4f} is low; fine-tuning +20 epochs @ lr*0.1...")
         train_clean_classifier(m2, m2_train_loader, m2_test_loader, 20, args.lr_m * 0.1, logger, '[M2-extra]')
         m2_acc = eval_clean(m2, m2_test_loader)
         logger.log(f'[M2] Updated Clean Test Acc: {m2_acc:.4f}')
 
-    # Stage 2: Fusion + Scheme A adversarial training
-    # Infer penultimate concat dimension and build head
+    # Stage 2: Fusion + Scheme A adversarial training (epsilon curriculum)
     penult_dim = infer_penult_dim(m1, m2, full_train_loader)
     logger.log(f'Inferred penultimate concat dim: {penult_dim}')
     head = HeadG(in_dim=penult_dim, num_classes=10).to(DEVICE)
 
-    # Build fusion model
     fusion = FusionHead(m1, m2, head).to(DEVICE)
 
-    # Partial unfreeze (only last residual stage from each backbone)
-    last1, last2 = set_partial_unfreeze_and_modes(fusion.m1, fusion.m2)
-    logger.log(f'Partial-unfreeze last stages: '
-               f'M1[{last1.__class__.__name__}], M2[{last2.__class__.__name__}]')
+    # Partially unfreeze LAST TWO stages of each backbone
+    train_s1, train_s2 = set_partial_unfreeze_and_modes(fusion.m1, fusion.m2, depth=2)
+    logger.log(f'Partial-unfreeze stages: M1[{len(train_s1)}], M2[{len(train_s2)}]')
 
-    # CE warmup (head + last stages)
-    logger.log("Warmup (CE) for fusion: 5 epochs (head + last stages)...")
+    # Short CE warmup for Fusion (stabilize head + stages)
+    logger.log("Warmup (CE) for fusion: 5 epochs (head + last two stages)...")
     warm_args = argparse.Namespace(**vars(args))
     warm_args.trainer = 'ce'
     warm_args.epochs_g = 5
-    train_fusion_adversarial_A(fusion, full_train_loader, full_test_loader, warm_args, logger)
+    train_fusion_adversarial_A(fusion, full_train_loader, full_test_loader, warm_args, logger,
+                               train_stages=(train_s1 + train_s2))
 
-    # Adversarial training with TRADES/MART
-    logger.log(f"Adversarial training ({args.trainer}) with eps={args.attack_eps}, "
-               f"step={args.attack_step}, iters={args.attack_iter} for {args.epochs_g} epochs...")
-    train_fusion_adversarial_A(fusion, full_train_loader, full_test_loader, args, logger)
+    # Epsilon curriculum for TRADES/MART
+    total = max(args.epochs_g, 1)
+    # 10 + 10 + 15 + remainder
+    phase1 = min(10, total)
+    phase2 = min(10, max(total - phase1, 0))
+    phase3 = min(15, max(total - phase1 - phase2, 0))
+    phase4 = max(total - phase1 - phase2 - phase3, 0)
 
+    def _phase(ep, eps, step, iters, tag):
+        phase_args = argparse.Namespace(**vars(args))
+        phase_args.trainer = args.trainer
+        phase_args.epochs_g = ep
+        phase_args.attack_eps = eps
+        phase_args.attack_step = step
+        phase_args.attack_iter = iters
+        logger.log(f"{tag}: eps={eps:.6f}, step={step:.6f}, iter={iters}, epochs={ep}")
+        if ep > 0:
+            train_fusion_adversarial_A(fusion, full_train_loader, full_test_loader, phase_args, logger,
+                                       train_stages=(train_s1 + train_s2))
+
+    # Phase 1: very gentle
+    _phase(phase1, 2/255, 0.5/255, 5,  "TRADES Phase 1")
+    # Phase 2: gentle
+    _phase(phase2, 4/255, 1/255,   7,  "TRADES Phase 2")
+    # Phase 3: moderate
+    _phase(phase3, 6/255, 1.5/255, 10, "TRADES Phase 3")
+    # Phase 4: target strength (use user args if remaining=0 we skip)
+    _phase(phase4, getattr(args, 'attack_eps', 8/255), getattr(args, 'attack_step', 2/255),
+           getattr(args, 'attack_iter', 10), "TRADES Phase 4")
+
+    # Final evaluation (use the CLI-provided eval attack)
     clean_g = eval_clean(fusion, full_test_loader)
     adv_g = eval_adv(fusion, full_test_loader, make_eval_attack(fusion, args))
     logger.log(f'[Fusion-A] Final Test Clean: {clean_g:.4f} | Final Test Adv: {adv_g:.4f}')
@@ -474,7 +472,7 @@ def main():
     torch.save({'model_state_dict': m1.state_dict()}, os.path.join(LOG_DIR, 'M1_6cls.pt'))
     torch.save({'model_state_dict': m2.state_dict()}, os.path.join(LOG_DIR, 'M2_4cls.pt'))
     torch.save({'model_state_dict': head.state_dict()}, os.path.join(LOG_DIR, 'G_head_10cls.pt'))
-    torch.save({'model_state_dict': fusion.state_dict()}, os.path.join(LOG_DIR, 'Fusion_partial_unfreeze.pt'))
+    torch.save({'model_state_dict': fusion.state_dict()}, os.path.join(LOG_DIR, 'Fusion_partial_unfreeze_depth2.pt'))
     logger.log(f'Saved models to {LOG_DIR}')
 
 
