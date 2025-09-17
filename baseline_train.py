@@ -184,7 +184,10 @@ def run_training(desc, num_classes=None, filter_classes=None, eval_metrics=None)
     _wandb_finish()
 
 # ---------------- run all ----------------
+# if __name__ == "__main__":
+#     run_training(desc="400_10-class",        num_classes=10, filter_classes=None,           eval_metrics=["animal", "vehicle", "bi"])
+#     run_training(desc="400_6-class-animal",  filter_classes=animal_classes,                 eval_metrics=["animal"])
+#     run_training(desc="400_4-class-vehicle", filter_classes=vehicle_classes,                eval_metrics=["vehicle"])
 if __name__ == "__main__":
-    run_training(desc="400_10-class",        num_classes=10, filter_classes=None,           eval_metrics=["animal", "vehicle", "bi"])
-    run_training(desc="400_6-class-animal",  filter_classes=animal_classes,                 eval_metrics=["animal"])
-    run_training(desc="400_4-class-vehicle", filter_classes=vehicle_classes,                eval_metrics=["vehicle"])
+    run_training(desc="flat10_only", num_classes=10, filter_classes=None, eval_metrics=["animal","vehicle","bi"])
+    raise SystemExit  # 防止继续跑 6/4 子集
