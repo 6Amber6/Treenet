@@ -271,8 +271,8 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema=None
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(set_to_none=True)
-            _, _, f_logits = model(x)
-            loss = F.cross_entropy(f_logits, y)
+            logits = model(x)  # M1/M2 只返回一个 logits
+            loss = F.cross_entropy(logits, y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
