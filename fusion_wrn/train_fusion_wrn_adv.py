@@ -213,6 +213,8 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag):
     sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[epochs // 2, int(epochs * 0.75)], gamma=0.1)
     for ep in range(1, epochs + 1):
         model.train()
+        total_loss = 0.0
+        num_batches = 0
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(set_to_none=True)
@@ -221,18 +223,21 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
+            total_loss += loss.item()
+            num_batches += 1
         sch.step()
+        avg_loss = total_loss / max(num_batches, 1)
         if ep % 5 == 0 or ep == 1:
             acc = eval_clean(model, test_loader)
-            logger.log(f'{tag} Epoch {ep:03d} | Test Acc {acc:.4f}')
+            logger.log(f'{tag} Epoch {ep:03d} | Train Loss {avg_loss:.4f} | Test Acc {acc:.4f}')
 
 
 def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
     # Staged LRs: Head LR high; M1/M2 lower
     params = [
-        {'params': model.head.parameters(), 'lr': args.lr},
-        {'params': model.m1.parameters(), 'lr': args.lr * 0.1},
-        {'params': model.m2.parameters(), 'lr': args.lr * 0.1},
+        {'params': model.head.parameters(), 'lr': args.lr * 0.5},  # 降低Head学习率
+        {'params': model.m1.parameters(), 'lr': args.lr * 0.05},   # 进一步降低M1学习率
+        {'params': model.m2.parameters(), 'lr': args.lr * 0.05},   # 进一步降低M2学习率
     ]
     opt = torch.optim.SGD(params, momentum=0.9, weight_decay=5e-4, nesterov=True)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs_g, eta_min=1e-6)
@@ -240,6 +245,8 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
     # CE warmup 5 epochs
     for ep in range(1, min(5, args.epochs_g) + 1):
         model.train()
+        total_loss = 0.0
+        num_batches = 0
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(set_to_none=True)
@@ -248,25 +255,33 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
+            total_loss += loss.item()
+            num_batches += 1
         sch.step()
+        avg_loss = total_loss / max(num_batches, 1)
         clean = eval_clean(model, test_loader)
-        logger.log(f'[WRN-Fusion-CE] Epoch {ep:03d} | Test Clean {clean:.4f}')
+        logger.log(f'[WRN-Fusion-CE] Epoch {ep:03d} | Train Loss {avg_loss:.4f} | Test Clean {clean:.4f}')
 
     # TRADES
     atk = make_eval_attack(model, args)
     for ep in range(6, args.epochs_g + 1):
         model.train()
+        total_loss = 0.0
+        num_batches = 0
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
-            _ = trades_fusion_step(model, x, y, optimizer=opt,
+            loss = trades_fusion_step(model, x, y, optimizer=opt,
                                    step_size=getattr(args, 'attack_step', 2/255),
                                    epsilon=getattr(args, 'attack_eps', 8/255),
-                                   perturb_steps=getattr(args, 'attack_iter', 12),
-                                   beta=args.beta, aux_w=0.05)
+                                   perturb_steps=getattr(args, 'attack_iter', 8),  # 减少攻击迭代次数
+                                   beta=args.beta * 0.5, aux_w=0.02)  # 降低beta和aux权重
+            total_loss += loss.item()
+            num_batches += 1
         sch.step()
+        avg_loss = total_loss / max(num_batches, 1)
         clean = eval_clean(model, test_loader)
         adv = eval_adv(model, test_loader, atk)
-        logger.log(f'[WRN-Fusion-TRADES] Epoch {ep:03d} | Test Clean {clean:.4f} | Test Adv {adv:.4f}')
+        logger.log(f'[WRN-Fusion-TRADES] Epoch {ep:03d} | Train Loss {avg_loss:.4f} | Test Clean {clean:.4f} | Test Adv {adv:.4f}')
 
 
 def eval_adv(model, loader, attack) -> float:
