@@ -356,7 +356,6 @@ def main():
     parse.add_argument('--epochs-m', type=int, default=100)
     parse.add_argument('--epochs-g', type=int, default=120)    # longer fusion training
     parse.add_argument('--lr-m', type=float, default=0.1)
-    parse.add_argument('--lr', type=float, default=0.1)
     parse.add_argument('--beta', type=float, default=8.0)
     parse.add_argument('--aux_w', type=float, default=0.02)
     parse.add_argument('--attack', type=str, default='linf-pgd')
