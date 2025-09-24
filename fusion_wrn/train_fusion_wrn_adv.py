@@ -353,14 +353,12 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
 # ------------------------------ Main -----------------------------------
 def main():
     parse = parser_train()
-    parse.add_argument('--epochs-m', type=int, default=100)
-    parse.add_argument('--epochs-g', type=int, default=120)    # longer fusion training
-    parse.add_argument('--lr-m', type=float, default=0.1)
-    parse.add_argument('--aux_w', type=float, default=0.02)
-    parse.add_argument('--attack', type=str, default='linf-pgd')
-    parse.add_argument('--attack_eps', type=float, default=8/255)
-    parse.add_argument('--attack_step', type=float, default=2/255)
-    parse.add_argument('--attack_iter', type=int, default=12)  # train inner steps; eval uses 20 inside make_eval_attack
+
+    parse.add_argument('--epochs-m', type=int, default=100, help="epochs for submodels M1/M2")
+    parse.add_argument('--epochs-g', type=int, default=120, help="epochs for fusion model")
+    parse.add_argument('--lr-m', type=float, default=0.1, help="learning rate for submodels")
+    parse.add_argument('--aux_w', type=float, default=0.02, help="weight for auxiliary CE loss")
+
     args = parse.parse_args()
 
     DATA_DIR = os.path.join(args.data_dir, args.data)
@@ -376,15 +374,20 @@ def main():
     seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
-    # Loaders
-    _, full_train = _build_cifar10(DATA_DIR, train=True, num_workers=getattr(args, 'workers', 4), batch_size=args.batch_size)
-    _, full_test  = _build_cifar10(DATA_DIR, train=False, num_workers=getattr(args, 'workers', 4), batch_size=args.batch_size)
-    m1_train = build_filtered_loader(DATA_DIR, animal_classes, args.batch_size, train=True,  num_workers=getattr(args, 'workers', 4))
-    m1_test  = build_filtered_loader(DATA_DIR, animal_classes, args.batch_size, train=False, num_workers=getattr(args, 'workers', 4))
-    m2_train = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=True,  num_workers=getattr(args, 'workers', 4))
-    m2_test  = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=False, num_workers=getattr(args, 'workers', 4))
+    # ----------------- Dataloaders -----------------
+    _, full_train = _build_cifar10(DATA_DIR, train=True,
+                                   num_workers=getattr(args, 'workers', 4),
+                                   batch_size=args.batch_size)
+    _, full_test  = _build_cifar10(DATA_DIR, train=False,
+                                   num_workers=getattr(args, 'workers', 4),
+                                   batch_size=args.batch_size)
 
-    # Stage 1: submodels (WRN-28-10), CE
+    m1_train = build_filtered_loader(DATA_DIR, animal_classes, args.batch_size, train=True)
+    m1_test  = build_filtered_loader(DATA_DIR, animal_classes, args.batch_size, train=False)
+    m2_train = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=True)
+    m2_test  = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=False)
+
+    # ----------------- Train submodels -----------------
     logger.log(f'Training M1 (WRN-28-10, 6-class) for {args.epochs_m} epochs (CE)')
     m1 = build_wrn_28_10(num_classes=len(animal_classes))
     train_ce(m1, m1_train, m1_test, args.epochs_m, args.lr_m, logger, '[M1]')
@@ -398,7 +401,7 @@ def main():
     logger.log(f'[M1] Clean Test Acc: {a_acc:.4f}')
     logger.log(f'[M2] Clean Test Acc: {v_acc:.4f}')
 
-    # Stage 2: fusion
+    # ----------------- Fusion training -----------------
     in_dim = int(m1.fc.in_features + m2.fc.in_features)
     head = WRNHead(in_dim=in_dim, num_classes=10, p_drop=0.2).to(DEVICE)
     fusion = FusionWRN(m1, m2, head).to(DEVICE)
@@ -406,14 +409,10 @@ def main():
     logger.log('Starting fusion training with TRADES (WRN-28-10 backbones)')
     train_fusion(fusion, full_train, full_test, args, logger)
 
-    # Final EMA eval & save
+    # ----------------- Final Eval & Save -----------------
     atk = make_eval_attack(fusion, args)
-    # quick EMA for final report
-    ema_final = EMA(fusion, decay=0.999);  # shadow untrained; apply for consistency
-    ema_final.apply_to(fusion)
     clean = eval_clean(fusion, full_test)
     adv   = eval_adv(fusion, full_test, atk)
-    ema_final.restore(fusion)
     logger.log(f'[WRN-Fusion] Final Test Clean {clean:.4f} | Adv {adv:.4f}')
 
     torch.save({'model_state_dict': m1.state_dict()},   os.path.join(LOG_DIR, 'M1_WRN.pt'))
