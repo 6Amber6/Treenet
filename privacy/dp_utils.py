@@ -210,10 +210,10 @@ def compute_accuracy(model: nn.Module, data_loader: torch.utils.data.DataLoader,
     with torch.no_grad():
         for data, target in data_loader:
             data, target = data.to(device), target.to(device)
-            if isinstance(model, tuple):  # For models that return (logits, embeddings)
-                output, _ = model(data)
-            else:
-                output = model(data)
+            output = model(data)
+            # Some models return (logits, embeddings); normalize to logits
+            if isinstance(output, tuple):
+                output = output[0]
             
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()

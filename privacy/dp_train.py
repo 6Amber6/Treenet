@@ -19,7 +19,7 @@ import torchvision.transforms as T
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from privacy.dp_models_paper import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
+from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
 from privacy.dp_utils import PrivacyAccountant, DPOptimizer, DataProcessor, compute_accuracy
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
