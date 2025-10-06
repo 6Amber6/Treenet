@@ -1,6 +1,6 @@
 """
 Training script for DP-SGD with hierarchical (4-class + 6-class fusion) vs baseline (10-class).
-Implements per-sample gradient computation with vectorized vmap approach.
+Implements per-sample gradient computation with vectorized approach.
 """
 
 import argparse
@@ -14,8 +14,27 @@ from privacy.dp_utils import (
     compute_epsilon_opacus,
     solve_noise_from_epsilon_opacus,
     DataProcessor,
+    dp_step_images,
 )
+
 from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
+
+
+# ------------------------------
+# Helper: remap targets to match subset labels
+# ------------------------------
+def remap_targets(y, dataset):
+    """
+    Ensure that labels match the number of classes in the current model.
+    If dataset has a custom .targets attribute (set in dp_utils), use it.
+    """
+    if hasattr(dataset, "targets"):
+        # if Subset, get targets from .dataset
+        if isinstance(dataset.targets, torch.Tensor):
+            return dataset.targets[y]
+        elif isinstance(dataset.targets, list):
+            return torch.tensor(dataset.targets)[y]
+    return y
 
 
 # ------------------------------
@@ -29,27 +48,35 @@ def train_dp(model, train_loader, test_loader, epochs, lr, noise_multiplier, max
     eps = 0.0
     for epoch in range(epochs):
         model.train()
-        correct, total = 0, 0
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
+            # remap labels if needed
+            y = remap_targets(y, train_loader.dataset).to(device)
 
             optimizer.zero_grad()
 
-            # 计算 per-sample gradients 并加噪
-            from privacy.dp_utils import dp_step_images
+            # DP-SGD step
             preclip_norm = dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm)
 
             steps += 1
-            eps = compute_epsilon_opacus(noise_multiplier, train_loader.batch_size / len(train_loader.dataset), steps, delta)
+            eps = compute_epsilon_opacus(
+                noise_multiplier,
+                train_loader.batch_size / len(train_loader.dataset),
+                steps,
+                delta,
+            )
 
             if batch_idx % 50 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss(mean) {F.cross_entropy(model(x)[0], y).item():.4f}, "
-                      f"PreClip||g|| {preclip_norm:.2f}, ε={eps:.3f}, δ={delta:.1e}")
+                loss_val = F.cross_entropy(model(x)[0], y).item()
+                print(f"Epoch {epoch}, Batch {batch_idx}, "
+                      f"Loss {loss_val:.4f}, PreClip||g|| {preclip_norm:.2f}, "
+                      f"ε={eps:.3f}, δ={delta:.1e}")
 
         # Epoch end: compute accuracy
         train_acc = compute_accuracy(model, train_loader, device)
         test_acc = compute_accuracy(model, test_loader, device)
-        print(f"Epoch {epoch}: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, Privacy ε={eps:.3f}, δ={delta:.1e}")
+        print(f"Epoch {epoch}: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, "
+              f"Privacy ε={eps:.3f}, δ={delta:.1e}")
 
     return train_acc, eps, delta
 
@@ -95,19 +122,19 @@ def main():
 
     # ---------------- training ----------------
     if args.train_all or args.train_4class:
-        print("\nTraining 4class with vectorized per-sample DP-SGD...")
+        print("\nTraining 4class with DP-SGD...")
         model4 = DP4Classifier()
         train_dp(model4, m4_train, m4_test, args.epochs_4class, args.lr,
                  args.noise_multiplier, args.max_grad_norm, args.delta, device)
 
     if args.train_all or args.train_6class:
-        print("\nTraining 6class with vectorized per-sample DP-SGD...")
+        print("\nTraining 6class with DP-SGD...")
         model6 = DP6Classifier()
         train_dp(model6, m6_train, m6_test, args.epochs_6class, args.lr,
                  args.noise_multiplier, args.max_grad_norm, args.delta, device)
 
     if args.train_all or args.train_10class:
-        print("\nTraining 10class (baseline) with vectorized per-sample DP-SGD...")
+        print("\nTraining 10class (baseline) with DP-SGD...")
         model10 = DP10Classifier()
         train_dp(model10, m10_train, m10_test, args.epochs_10class, args.lr,
                  args.noise_multiplier, args.max_grad_norm, args.delta, device)
@@ -118,17 +145,17 @@ def main():
         model6 = DP6Classifier().to(device)
         fusion = DPFusionModel()
 
+        # Freeze sub-models
         model4.eval()
         model6.eval()
         fusion.to(device)
         optimizer = optim.SGD(fusion.parameters(), lr=args.lr, momentum=0.9)
 
-        steps = 0
         for epoch in range(args.epochs_fusion):
             fusion.train()
             for (x4, y4), (x6, y6) in zip(m4_train, m6_train):
-                x4, y4 = x4.to(device), y4.to(device)
-                x6, y6 = x6.to(device), y6.to(device)
+                x4, y4 = x4.to(device), remap_targets(y4, m4_train.dataset).to(device)
+                x6, y6 = x6.to(device), remap_targets(y6, m6_train.dataset).to(device)
 
                 with torch.no_grad():
                     _, emb4 = model4(x4)
@@ -136,7 +163,6 @@ def main():
 
                 optimizer.zero_grad()
                 logits = fusion(emb4, emb6)
-
                 loss = F.cross_entropy(logits, y4[:logits.size(0)])
                 loss.backward()
                 optimizer.step()
