@@ -12,7 +12,6 @@ from torch import optim
 from privacy.dp_utils import (
     compute_accuracy,
     compute_epsilon_opacus,
-    solve_noise_from_epsilon_opacus,
     DataProcessor,
     dp_step_images,
 )
