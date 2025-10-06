@@ -32,9 +32,9 @@ class PrivacyAccountant:
         if self.noise_multiplier == 0:
             return float('inf')
         
-        # Use RDP to compute epsilon
-        alphas = np.arange(2, 100, 0.1)
-        rdps = [self.compute_rdp(alpha) for alpha in alphas]
+        # Use a simplified RDP approximation; steps scales linearly
+        alphas = np.arange(2, 100, 0.5)
+        rdps = [steps * self.compute_rdp(alpha) for alpha in alphas]
         
         # Convert RDP to (epsilon, delta)
         epsilons = []
@@ -48,6 +48,23 @@ class PrivacyAccountant:
         """Get privacy spent (epsilon, delta) for given number of steps"""
         epsilon = self.compute_epsilon(delta, steps)
         return epsilon, delta
+
+
+def solve_noise_from_epsilon(target_epsilon: float, delta: float, steps: int) -> float:
+    """
+    Solve noise_multiplier such that epsilon ~= target_epsilon under the same RDP approx.
+    Uses a simple monotonic binary search over noise in [1e-3, 50].
+    """
+    lo, hi = 1e-3, 50.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        acc = PrivacyAccountant(mid, batch_size=1, dataset_size=1)
+        eps = acc.compute_epsilon(delta, steps)
+        if eps > target_epsilon:
+            lo = mid
+        else:
+            hi = mid
+    return hi
 
 
 class GradientClipper:
@@ -80,12 +97,14 @@ class DPOptimizer:
     """DP-SGD optimizer with gradient clipping and noise addition"""
     
     def __init__(self, model: nn.Module, optimizer: torch.optim.Optimizer, 
-                 noise_multiplier: float, max_grad_norm: float = 1.0):
+                 noise_multiplier: float, max_grad_norm: float = 1.0,
+                 momentum_beta: float = 0.0, clip_constant: float = 1.0):
         self.model = model
         self.optimizer = optimizer
         self.noise_multiplier = noise_multiplier
         self.gradient_clipper = GradientClipper(max_grad_norm)
         self.privacy_accountant = None
+        self.clip_constant = clip_constant
         
     def step(self, batch_size: int, dataset_size: int):
         """Perform DP-SGD step with gradient clipping and noise addition"""
@@ -96,7 +115,7 @@ class DPOptimizer:
         if self.noise_multiplier > 0:
             for p in self.model.parameters():
                 if p.grad is not None:
-                    noise = torch.normal(0, self.noise_multiplier * self.gradient_clipper.max_norm, 
+                    noise = torch.normal(0, self.noise_multiplier * self.clip_constant, 
                                         size=p.grad.shape, device=p.grad.device)
                     p.grad.data.add_(noise)
         

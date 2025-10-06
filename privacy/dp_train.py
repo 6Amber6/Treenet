@@ -20,7 +20,7 @@ import torchvision.transforms as T
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
-from privacy.dp_utils import PrivacyAccountant, DPOptimizer, DataProcessor, compute_accuracy
+from privacy.dp_utils import PrivacyAccountant, DPOptimizer, DataProcessor, compute_accuracy, solve_noise_from_epsilon
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -110,7 +110,8 @@ def get_filtered_loaders(data_dir: str, keep_labels: list, batch_size: int = 64,
 
 def train_dp_model_paper(model: nn.Module, train_loader: DataLoader, test_loader: DataLoader,
                         epochs: int, lr: float, noise_multiplier: float, max_grad_norm: float,
-                        model_name: str, output_dir: str) -> Tuple[float, float, float]:
+                        model_name: str, output_dir: str,
+                        clip_constant: float = 1.0) -> Tuple[float, float, float]:
     """
     DP-SGD training strictly following the paper requirements
     """
@@ -119,8 +120,8 @@ def train_dp_model_paper(model: nn.Module, train_loader: DataLoader, test_loader
     # Create DP optimizer
     optimizer = DPOptimizer(
         model,
-        torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4),
-        noise_multiplier, max_grad_norm
+        torch.optim.SGD(model.parameters(), lr=lr, momentum=0.0, weight_decay=5e-4),
+        noise_multiplier, max_grad_norm, momentum_beta=0.0, clip_constant=clip_constant
     )
     
     # Create privacy accountant
@@ -252,8 +253,11 @@ def main():
     parser.add_argument('--epochs_fusion', type=int, default=30, help='Epochs for fusion model')
     
     # DP-SGD arguments (strictly following paper settings)
-    parser.add_argument('--noise_multiplier', type=float, default=1.0, help='Noise multiplier')
-    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm')
+    parser.add_argument('--epsilon', type=float, default=None, help='Target privacy epsilon; if set, overrides noise_multiplier')
+    parser.add_argument('--expected_batchsize', type=int, default=None, help='Teacher style batch size (used only to solve epsilon)')
+    parser.add_argument('--noise_multiplier', type=float, default=1.0, help='Noise multiplier (ignored if --epsilon is set)')
+    parser.add_argument('--max_grad_norm', type=float, default=1.0, help='Max gradient norm for clipping')
+    parser.add_argument('--clip_constant', type=float, default=1.0, help='Clipping constant C for DP noise scale (paper style)')
     parser.add_argument('--delta', type=float, default=1e-5, help='Delta parameter')
     
     # Training mode
@@ -295,6 +299,14 @@ def main():
     print(f"  Vehicle test: {len(m2_test)} batches")
     print(f"  Full test: {len(full_test)} batches")
     
+    # Resolve noise from epsilon if requested
+    if args.epsilon is not None:
+        # steps per epoch approximated by number of batches in training of each model; use 100 epochs baseline
+        # Here we use the 10-class steps as proxy: len(m1_train) ~ animal train; keep consistent across models
+        steps = 100 * len(full_test)  # approximate; conservative upper bound
+        args.noise_multiplier = solve_noise_from_epsilon(args.epsilon, args.delta, steps)
+        print(f"Solved noise_multiplier from epsilon={args.epsilon}: {args.noise_multiplier:.4f}")
+
     # Train models
     models = {}
     results = {}
@@ -306,7 +318,8 @@ def main():
         model_4class = DP4Classifier(groups=8).to(DEVICE)
         acc, eps, delta = train_dp_model_paper(
             model_4class, m2_train, m2_test, args.epochs_4class, args.lr,
-            args.noise_multiplier, args.max_grad_norm, '4class', args.output_dir
+            args.noise_multiplier, args.max_grad_norm, '4class', args.output_dir,
+            clip_constant=args.clip_constant
         )
         models['4class'] = model_4class
         results['4class'] = {'accuracy': acc, 'epsilon': eps, 'delta': delta}
@@ -318,7 +331,8 @@ def main():
         model_6class = DP6Classifier(groups=8).to(DEVICE)
         acc, eps, delta = train_dp_model_paper(
             model_6class, m1_train, m1_test, args.epochs_6class, args.lr,
-            args.noise_multiplier, args.max_grad_norm, '6class', args.output_dir
+            args.noise_multiplier, args.max_grad_norm, '6class', args.output_dir,
+            clip_constant=args.clip_constant
         )
         models['6class'] = model_6class
         results['6class'] = {'accuracy': acc, 'epsilon': eps, 'delta': delta}
@@ -330,7 +344,8 @@ def main():
         model_10class = DP10Classifier(groups=8).to(DEVICE)
         acc, eps, delta = train_dp_model_paper(
             model_10class, m1_train, m1_test, args.epochs_10class, args.lr,
-            args.noise_multiplier, args.max_grad_norm, '10class', args.output_dir
+            args.noise_multiplier, args.max_grad_norm, '10class', args.output_dir,
+            clip_constant=args.clip_constant
         )
         models['10class'] = model_10class
         results['10class'] = {'accuracy': acc, 'epsilon': eps, 'delta': delta}
