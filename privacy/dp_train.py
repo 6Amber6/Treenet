@@ -1,6 +1,6 @@
 """
 Training script for DP-SGD with hierarchical (4-class + 6-class fusion) vs baseline (10-class).
-Implements per-sample gradient computation with vectorized approach.
+Implements per-sample gradient computation with DP noise.
 """
 
 import argparse
@@ -16,31 +16,31 @@ from privacy.dp_utils import (
     DataProcessor,
     dp_step_images,
 )
-
 from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
 
 
 # ------------------------------
-# Helper: remap targets to match subset labels
+# Label remapping helper
 # ------------------------------
-def remap_targets(y, dataset):
+def remap_targets(y, dataset, device):
     """
-    Ensure that labels match the number of classes in the current model.
-    If dataset has a custom .targets attribute (set in dp_utils), use it.
+    Ensure that labels are consistent with current dataset split.
+    Fix device mismatch by mapping on CPU, then move back to device.
     """
     if hasattr(dataset, "targets"):
-        # if Subset, get targets from .dataset
-        if isinstance(dataset.targets, torch.Tensor):
-            return dataset.targets[y]
-        elif isinstance(dataset.targets, list):
-            return torch.tensor(dataset.targets)[y]
-    return y
+        targets = dataset.targets
+        if isinstance(targets, torch.Tensor):
+            return targets[y.cpu()].to(device)
+        elif isinstance(targets, list):
+            return torch.tensor(targets, device="cpu")[y.cpu()].to(device)
+    return y.to(device)
 
 
 # ------------------------------
 # Training loop with per-sample DP-SGD
 # ------------------------------
-def train_dp(model, train_loader, test_loader, epochs, lr, noise_multiplier, max_grad_norm, delta, device):
+def train_dp(model, train_loader, test_loader, epochs, lr,
+             noise_multiplier, max_grad_norm, delta, device):
     model.to(device)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
 
@@ -50,12 +50,13 @@ def train_dp(model, train_loader, test_loader, epochs, lr, noise_multiplier, max
         model.train()
         for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(device), y.to(device)
-            # remap labels if needed
-            y = remap_targets(y, train_loader.dataset).to(device)
+
+            # remap targets safely
+            y = remap_targets(y, train_loader.dataset, device)
 
             optimizer.zero_grad()
 
-            # DP-SGD step
+            # DP-SGD update
             preclip_norm = dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm)
 
             steps += 1
@@ -68,11 +69,10 @@ def train_dp(model, train_loader, test_loader, epochs, lr, noise_multiplier, max
 
             if batch_idx % 50 == 0:
                 loss_val = F.cross_entropy(model(x)[0], y).item()
-                print(f"Epoch {epoch}, Batch {batch_idx}, "
-                      f"Loss {loss_val:.4f}, PreClip||g|| {preclip_norm:.2f}, "
-                      f"ε={eps:.3f}, δ={delta:.1e}")
+                print(f"Epoch {epoch}, Batch {batch_idx}, Loss {loss_val:.4f}, "
+                      f"PreClip||g|| {preclip_norm:.2f}, ε={eps:.3f}, δ={delta:.1e}")
 
-        # Epoch end: compute accuracy
+        # Epoch end: accuracy
         train_acc = compute_accuracy(model, train_loader, device)
         test_acc = compute_accuracy(model, test_loader, device)
         print(f"Epoch {epoch}: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, "
@@ -82,7 +82,7 @@ def train_dp(model, train_loader, test_loader, epochs, lr, noise_multiplier, max
 
 
 # ------------------------------
-# Main function
+# Main
 # ------------------------------
 def main():
     parser = argparse.ArgumentParser()
@@ -114,7 +114,7 @@ def main():
     print(f"DP params: sigma={args.noise_multiplier}, C={args.max_grad_norm}, delta={args.delta}")
     print(f"LR={args.lr}, batch_size={args.batch_size}")
 
-    # Load CIFAR-10 datasets
+    # Data
     loaders = DataProcessor.create_data_loaders(args.data_dir, batch_size=args.batch_size)
     m4_train, m4_test = loaders["vehicle_train"], loaders["vehicle_test"]
     m6_train, m6_test = loaders["animal_train"], loaders["animal_test"]
@@ -145,7 +145,6 @@ def main():
         model6 = DP6Classifier().to(device)
         fusion = DPFusionModel()
 
-        # Freeze sub-models
         model4.eval()
         model6.eval()
         fusion.to(device)
@@ -154,8 +153,11 @@ def main():
         for epoch in range(args.epochs_fusion):
             fusion.train()
             for (x4, y4), (x6, y6) in zip(m4_train, m6_train):
-                x4, y4 = x4.to(device), remap_targets(y4, m4_train.dataset).to(device)
-                x6, y6 = x6.to(device), remap_targets(y6, m6_train.dataset).to(device)
+                x4, y4 = x4.to(device), y4.to(device)
+                x6, y6 = x6.to(device), y6.to(device)
+
+                y4 = remap_targets(y4, m4_train.dataset, device)
+                y6 = remap_targets(y6, m6_train.dataset, device)
 
                 with torch.no_grad():
                     _, emb4 = model4(x4)
