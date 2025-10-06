@@ -207,9 +207,6 @@ def compute_accuracy(model: nn.Module, data_loader: torch.utils.data.DataLoader,
     return correct / total
 
 
-# ============================================================
-# Per-sample DP-SGD Step
-# ============================================================
 def dp_step_images(model, optimizer, x, y, noise_multiplier: float, max_grad_norm: float) -> float:
     """
     Perform a DP-SGD step with per-sample gradient clipping and Gaussian noise.
@@ -234,8 +231,11 @@ def dp_step_images(model, optimizer, x, y, noise_multiplier: float, max_grad_nor
         only_inputs=True
     )
 
-    # Compute per-sample gradient norms
-    grad_norms = torch.stack([g.view(g.size(0), -1).norm(2, dim=1) for g in per_sample_grads], dim=1).sum(dim=1)
+    # Compute per-sample gradient norms correctly
+    grad_norms = []
+    for g in per_sample_grads:
+        grad_norms.append(g.view(g.size(0), -1).pow(2).sum(dim=1))  # [batch_size]
+    grad_norms = torch.stack(grad_norms, dim=0).sum(dim=0).sqrt()   # [batch_size]
     mean_norm = grad_norms.mean().item()
 
     # Clip gradients
