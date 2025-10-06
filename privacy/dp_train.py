@@ -1,26 +1,22 @@
 """
-DP-SGD training (per-sample clipping) + hierarchical vs baseline experiments
+Per-sample DP-SGD training:
+- 4-class (vehicles), 6-class (animals), 10-class baseline, and Fusion
+- Correct epsilon accounting via Opacus (if available)
 """
 
 import os, sys, json, math
-from typing import Tuple, Dict, List
+from typing import List, Tuple, Dict
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from torch import nn
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
 
-# import project
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
-from privacy.dp_utils import (
-    DPOptimizer,
-    compute_accuracy,
-    compute_epsilon_opacus,
-    solve_noise_from_epsilon_opacus,
-)
+from privacy.dp_utils import DPOptimizer, compute_accuracy, compute_epsilon_opacus, solve_noise_from_epsilon_opacus
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
@@ -38,13 +34,13 @@ def get_cifar10_loaders(data_dir: str, batch_size: int, num_workers: int):
         T.ToTensor(),
         T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
     ])
-    train_ds = torchvision.datasets.CIFAR10(data_dir, train=True, download=True, transform=train_tf)
+    train_ds = torchvision.datasets.CIFAR10(data_dir, train=True,  download=True, transform=train_tf)
     test_ds  = torchvision.datasets.CIFAR10(data_dir, train=False, download=True, transform=test_tf)
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers,
-                              pin_memory=torch.cuda.is_available())
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                              pin_memory=torch.cuda.is_available())
-    return train_loader, test_loader
+    tr = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers,
+                    pin_memory=torch.cuda.is_available())
+    te = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                    pin_memory=torch.cuda.is_available())
+    return tr, te
 
 
 def get_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int, num_workers: int):
@@ -58,13 +54,12 @@ def get_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int,
         return torch.utils.data.Subset(ds, idx)
 
     tr_sub = subset(full_train.dataset, keep_labels)
-    te_sub = subset(full_test.dataset, keep_labels)
+    te_sub = subset(full_test.dataset,  keep_labels)
 
     remap = {old: new for new, old in enumerate(keep_labels)}
 
     class RemapDS(torch.utils.data.Dataset):
-        def __init__(self, base, remap):
-            self.base, self.remap = base, remap
+        def __init__(self, base, remap): self.base, self.remap = base, remap
         def __len__(self): return len(self.base)
         def __getitem__(self, i):
             x, y = self.base[i]
@@ -73,11 +68,11 @@ def get_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int,
     tr = RemapDS(tr_sub, remap)
     te = RemapDS(te_sub, remap)
 
-    train_loader = DataLoader(tr, batch_size=batch_size, shuffle=True,  num_workers=num_workers,
-                              pin_memory=torch.cuda.is_available())
-    test_loader  = DataLoader(te, batch_size=batch_size, shuffle=False, num_workers=num_workers,
-                              pin_memory=torch.cuda.is_available())
-    return train_loader, test_loader
+    tr_loader = DataLoader(tr, batch_size=batch_size, shuffle=True,  num_workers=num_workers,
+                           pin_memory=torch.cuda.is_available())
+    te_loader = DataLoader(te, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+                           pin_memory=torch.cuda.is_available())
+    return tr_loader, te_loader
 
 
 def train_dp(model: nn.Module,
@@ -90,11 +85,10 @@ def train_dp(model: nn.Module,
              delta: float,
              model_name: str,
              outdir: str):
-
     print(f"\nTraining {model_name} with per-sample DP-SGD...")
-    # 使用 momentum=0.9（若论文要求 0.0，可改为 0.0）
+
     base_opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    dp_opt   = DPOptimizer(model, base_opt, noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm)
+    dp_opt = DPOptimizer(model, base_opt, noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm)
 
     best = 0.0
     steps = 0
@@ -106,12 +100,12 @@ def train_dp(model: nn.Module,
 
         for b, (x, y) in enumerate(train_loader):
             x, y = x.to(DEVICE), y.to(DEVICE)
-            # per-sample losses
-            logits, _ = model(x) if isinstance(model, (DP4Classifier, DP6Classifier, DP10Classifier)) else (model(x), None)
+            out = model(x)
+            logits = out[0] if isinstance(out, tuple) else out
             loss_i = F.cross_entropy(logits, y, reduction='none')
 
             dp_opt.zero_grad()
-            pre = dp_opt.dp_step(loss_i, batch_size=y.size(0))  # 返回平均 pre-clip 范数，便于监控
+            pre = dp_opt.dp_step(loss_i, batch_size=y.size(0))
             steps += 1
 
             with torch.no_grad():
@@ -126,10 +120,9 @@ def train_dp(model: nn.Module,
                       f"PreClip||g|| {pre:.2f}, ε={eps:.3f}, δ={delta:.1e}")
 
         train_acc = correct / max(1, total)
-        test_acc  = compute_accuracy(model, test_loader, DEVICE)
+        test_acc = compute_accuracy(model, test_loader, DEVICE)
         q = (train_loader.batch_size or 1) / max(1, len(train_loader.dataset))
         eps = compute_epsilon_opacus(noise_multiplier, q, steps, delta)
-
         print(f"Epoch {ep}: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, Privacy ε={eps:.3f}, δ={delta:.1e}")
 
         if test_acc > best:
@@ -147,7 +140,6 @@ def extract_embeddings(model: nn.Module, loader: DataLoader):
     for x, y in loader:
         x = x.to(DEVICE)
         out = model(x)
-        # 分类器返回 (logits, emb)
         emb = out[1] if isinstance(out, tuple) else out
         E.append(emb.detach().cpu())
         Y.append(y.clone())
@@ -157,9 +149,9 @@ def extract_embeddings(model: nn.Module, loader: DataLoader):
 def train_fusion(model4, model6, full_train, full_test,
                  epochs, lr, noise_multiplier, max_grad_norm, delta, outdir):
     print("\nTraining FUSION with per-sample DP-SGD...")
+
     emb4, y4 = extract_embeddings(model4, full_train)
     emb6, y6 = extract_embeddings(model6, full_train)
-
     N = min(len(emb4), len(emb6), len(y4), len(y6))
     emb4, emb6, labels = emb4[:N], emb6[:N], y4[:N]
 
@@ -172,7 +164,7 @@ def train_fusion(model4, model6, full_train, full_test,
 
     fusion = DPFusionModel(embedding_dim=emb4.shape[1], num_classes=10, groups=8).to(DEVICE)
     base_opt = torch.optim.SGD(fusion.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
-    dp_opt   = DPOptimizer(fusion, base_opt, noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm)
+    dp_opt = DPOptimizer(fusion, base_opt, noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm)
 
     best = 0.0
     steps = 0
@@ -183,13 +175,11 @@ def train_fusion(model4, model6, full_train, full_test,
         total = 0
         for b, (e4, e6, y) in enumerate(floader):
             e4, e6, y = e4.to(DEVICE), e6.to(DEVICE), y.to(DEVICE)
-
-            # 模型 forward：fusion 模型接受两份 embedding
-            logits = fusion(e4, e6)
+            logits = fusion(e4, e6)           # fusion 模型接收两份 embedding
             loss_i = F.cross_entropy(logits, y, reduction='none')
 
             dp_opt.zero_grad()
-            dp_opt.dp_step(loss_i, batch_size=y.size(0))
+            pre = dp_opt.dp_step(loss_i, batch_size=y.size(0))
             steps += 1
 
             with torch.no_grad():
@@ -200,13 +190,13 @@ def train_fusion(model4, model6, full_train, full_test,
             if b % 50 == 0:
                 q = (floader.batch_size or 1) / max(1, len(fds))
                 eps = compute_epsilon_opacus(noise_multiplier, q, steps, delta)
-                print(f"[Fusion] Epoch {ep}, Batch {b}, Loss(mean) {loss_i.mean().item():.4f}, ε={eps:.3f}")
+                print(f"[Fusion] Epoch {ep}, Batch {b}, Loss(mean) {loss_i.mean().item():.4f}, "
+                      f"PreClip||g|| {pre:.2f}, ε={eps:.3f}")
 
         train_acc = correct / max(1, total)
         test_acc  = compute_accuracy(fusion, full_test, DEVICE)
         q = (floader.batch_size or 1) / max(1, len(fds))
         eps = compute_epsilon_opacus(noise_multiplier, q, steps, delta)
-
         print(f"[Fusion] Epoch {ep}: Train {train_acc:.4f}, Test {test_acc:.4f}, ε={eps:.3f}")
 
         if test_acc > best:
@@ -223,12 +213,12 @@ def estimate_steps(epochs: int, n: int, b: int) -> int:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser("Per-sample DP-SGD Training")
+    parser = argparse.ArgumentParser("Per-sample DP-SGD (hierarchical vs baseline)")
     parser.add_argument('--data_dir', type=str, default='./data')
     parser.add_argument('--output_dir', type=str, default='./results_all')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=0.02)
+    parser.add_argument('--lr', type=float, default=0.01)  # 稍微降低，DP更稳
 
     parser.add_argument('--epochs_4class', type=int, default=50)
     parser.add_argument('--epochs_6class', type=int, default=50)
@@ -269,7 +259,8 @@ def main():
         return b / max(1, n), estimate_steps(epochs, n, b)
 
     def sigma_for(loader, epochs):
-        if args.epsilon is None: return args.noise_multiplier
+        if args.epsilon is None:
+            return args.noise_multiplier
         q, steps = q_steps(loader, epochs)
         s = solve_noise_from_epsilon_opacus(args.epsilon, q, steps, args.delta)
         print(f"solve sigma: ε={args.epsilon}, q={q:.6f}, steps={steps} -> σ={s:.4f}")
@@ -278,7 +269,7 @@ def main():
     results: Dict[str, Dict[str, float]] = {}
     models: Dict[str, nn.Module] = {}
 
-    # 4-class
+    # 4-class (Vehicles)
     if args.train_all or args.train_4class:
         model4 = DP4Classifier(groups=8).to(DEVICE)
         sigma4 = sigma_for(m4_train, args.epochs_4class)
@@ -287,7 +278,7 @@ def main():
         results["4class"] = {"accuracy": acc, "epsilon": eps, "delta": delt}
         models["4class"] = model4
 
-    # 6-class
+    # 6-class (Animals)
     if args.train_all or args.train_6class:
         model6 = DP6Classifier(groups=8).to(DEVICE)
         sigma6 = sigma_for(m6_train, args.epochs_6class)
@@ -296,7 +287,7 @@ def main():
         results["6class"] = {"accuracy": acc, "epsilon": eps, "delta": delt}
         models["6class"] = model6
 
-    # 10-class
+    # 10-class baseline (Full CIFAR-10)
     if args.train_all or args.train_10class:
         model10 = DP10Classifier(groups=8).to(DEVICE)
         sigma10 = sigma_for(full_train, args.epochs_10class)
@@ -304,7 +295,7 @@ def main():
                                   sigma10, args.max_grad_norm, args.delta, "10class", args.output_dir)
         results["10class"] = {"accuracy": acc, "epsilon": eps, "delta": delt}
 
-    # Fusion
+    # Fusion (Full CIFAR-10 labels)
     if args.train_all or args.train_fusion:
         if "4class" in models and "6class" in models:
             sigmaF = sigma_for(full_train, args.epochs_fusion)

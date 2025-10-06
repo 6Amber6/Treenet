@@ -2,54 +2,50 @@
 Utilities for DP-SGD training (per-sample clipping + correct noise scaling)
 """
 
+from typing import Tuple, List, Dict
 import math
-from typing import Tuple, List, Dict, Optional
-
+import numpy as np
 import torch
 import torch.nn as nn
-import numpy as np
 
+# -------- Privacy accounting (Opacus if available) --------
 try:
     from opacus.accountants import RDPAccountant as OpacusRDPAccountant
 except Exception:
     OpacusRDPAccountant = None
 
 
-# --------------------------
-# Privacy accounting helpers
-# --------------------------
 class PrivacyAccountant:
-    """Fallback RDP accountant (simple closed form for Gaussian mech)."""
+    """
+    Simple fallback RDP accountant (Gaussian mech) when Opacus is unavailable.
+    Used only if compute_epsilon_opacus can't import Opacus.
+    """
+    def __init__(self, noise_multiplier: float):
+        self.sigma = float(noise_multiplier)
 
-    def __init__(self, noise_multiplier: float, batch_size: int, dataset_size: int):
-        self.noise_multiplier = noise_multiplier
-        self.batch_size = batch_size
-        self.dataset_size = dataset_size
-        self.sampling_rate = batch_size / max(1, dataset_size)
-
-    def compute_rdp(self, alpha: float) -> float:
-        if self.noise_multiplier == 0:
+    def _rdp(self, alpha: float) -> float:
+        if self.sigma <= 0:
             return float("inf")
-        # Gaussian mech RDP at order alpha
-        return alpha / (2 * (self.noise_multiplier ** 2))
+        return alpha / (2.0 * (self.sigma ** 2))
 
-    def compute_epsilon(self, delta: float, steps: int) -> float:
-        if self.noise_multiplier == 0:
+    def epsilon(self, steps: int, delta: float) -> float:
+        if self.sigma <= 0:
             return float("inf")
-        alphas = np.arange(2, 128, 1.0)
-        rdps = [steps * self.compute_rdp(a) for a in alphas]
-        eps = [r + math.log(1 / delta) / (a - 1) for a, r in zip(alphas, rdps)]
+        alphas = np.arange(2, 64, 1.0)
+        rdps = [steps * self._rdp(a) for a in alphas]
+        eps = [r + math.log(1.0 / delta) / (a - 1.0) for a, r in zip(alphas, rdps)]
         return float(min(eps))
-
-    def get_privacy_spent(self, steps: int, delta: float = 1e-5) -> Tuple[float, float]:
-        return self.compute_epsilon(delta, steps), delta
 
 
 def compute_epsilon_opacus(noise_multiplier: float, sample_rate: float, steps: int, delta: float) -> float:
-    """Prefer Opacus accountant when available; else fallback."""
+    """
+    Prefer Opacus RDP accountant with sampling rate q and steps.
+    Fallback to simple accountant if Opacus isn't available.
+    """
     if OpacusRDPAccountant is None:
-        acc = PrivacyAccountant(noise_multiplier, 1, 1)
-        return acc.compute_epsilon(delta, steps)
+        # crude fallback: ignore q, only use sigma & steps
+        return PrivacyAccountant(noise_multiplier).epsilon(steps, delta)
+
     acc = OpacusRDPAccountant()
     for _ in range(steps):
         acc.step(noise_multiplier=noise_multiplier, sample_rate=sample_rate)
@@ -57,7 +53,9 @@ def compute_epsilon_opacus(noise_multiplier: float, sample_rate: float, steps: i
 
 
 def solve_noise_from_epsilon_opacus(target_epsilon: float, sample_rate: float, steps: int, delta: float) -> float:
-    """Binary-search noise so that epsilon ~= target."""
+    """
+    Binary search sigma such that epsilon ~= target_epsilon under Opacus accountant.
+    """
     lo, hi = 1e-3, 50.0
     for _ in range(40):
         mid = 0.5 * (lo + hi)
@@ -69,25 +67,12 @@ def solve_noise_from_epsilon_opacus(target_epsilon: float, sample_rate: float, s
     return float(hi)
 
 
-# --------------------------
-# Per-sample DP-SGD optimizer
-# --------------------------
-def _clone_like_params(model: nn.Module):
-    """Create zero buffers shaped like .grad for accumulation."""
+# ------------------- Per-sample DP-SGD core -------------------
+def _zeros_like_params(model: nn.Module):
     bufs = []
     for p in model.parameters():
-        if p.requires_grad:
-            bufs.append(torch.zeros_like(p, memory_format=torch.preserve_format))
-        else:
-            bufs.append(None)
+        bufs.append(None if (not p.requires_grad) else torch.zeros_like(p, memory_format=torch.preserve_format))
     return bufs
-
-
-def _accumulate(bufs, scale: float):
-    """Scale all buffers by a factor (in-place)."""
-    for b in bufs:
-        if b is not None:
-            b.mul_(scale)
 
 
 def _add_inplace(dst, src):
@@ -96,117 +81,110 @@ def _add_inplace(dst, src):
             d.add_(s)
 
 
-def _grad_list_from_model(model: nn.Module):
-    grads = []
+def _scale_inplace(bufs, scale: float):
+    for b in bufs:
+        if b is not None:
+            b.mul_(scale)
+
+
+def _grab_grads(model: nn.Module):
+    out = []
     for p in model.parameters():
-        grads.append(None if (p.grad is None) else p.grad.detach().clone())
-    return grads
+        out.append(None if (p.grad is None) else p.grad.detach().clone())
+    return out
 
 
 class DPOptimizer:
     """
-    Pure-PyTorch per-sample DP-SGD (no functorch / no Opacus dependency).
-    Pipeline per batch:
-      1) per-sample loss (reduction='none')
-      2) loop each sample: backward -> get grads_i
-      3) clip each grads_i to L2 norm C
-      4) sum and average over batch
-      5) add Gaussian noise N(0,(sigma*C)^2) to each param
-      6) write averaged+noised grads to .grad and step()
+    Strict per-sample DP-SGD (framework-free):
+      For each batch of size B:
+        1) Compute per-sample losses (reduction='none')
+        2) For i in [0..B-1]:
+             zero_grad(); loss_i.backward(retain_graph)
+             collect grads_i; clip to C; sum into accumulator
+        3) Average accumulator by B
+        4) Add Gaussian noise with std = sigma*C/B to each averaged grad tensor
+        5) Write to .grad and optimizer.step()
     """
 
     def __init__(
         self,
         model: nn.Module,
-        optimizer: torch.optim.Optimizer,
+        base_optimizer: torch.optim.Optimizer,
         noise_multiplier: float,
         max_grad_norm: float = 1.0,
-        momentum_beta: float = 0.9,
-        clip_constant: float = 1.0,  # kept for compatibility; not used in scale anymore
     ):
         self.model = model
-        self.optimizer = optimizer
+        self.opt = base_optimizer
         self.sigma = float(noise_multiplier)
         self.C = float(max_grad_norm)
 
     def zero_grad(self):
-        self.optimizer.zero_grad(set_to_none=True)
+        self.opt.zero_grad(set_to_none=True)
 
     @torch.no_grad()
-    def _add_noise(self):
+    def _add_noise_on_average(self, batch_size: int):
+        """Noise is added on averaged gradient: std = sigma * C / B"""
         if self.sigma <= 0:
             return
+        std = (self.sigma * self.C) / max(1, batch_size)
         for p in self.model.parameters():
             if p.grad is None:
                 continue
             noise = torch.normal(
-                mean=0.0,
-                std=self.sigma * self.C,  # NOTE: std = sigma * C
-                size=p.grad.shape,
-                device=p.grad.device,
-                dtype=p.grad.dtype,
+                mean=0.0, std=std, size=p.grad.shape, device=p.grad.device, dtype=p.grad.dtype
             )
             p.grad.add_(noise)
 
-    def dp_step(self, loss_per_sample: torch.Tensor, batch_size: int):
+    def dp_step(self, loss_per_sample: torch.Tensor, batch_size: int) -> float:
         """
-        Args:
-          loss_per_sample: shape [B], unreduced CE losses for current batch
-          batch_size:      actual batch size B
-        Returns:
-          pre_clip_norm_avg: average of per-sample grad norms before clipping（仅监控）
+        :param loss_per_sample: shape [B]
+        :param batch_size:      int B
+        :return: average pre-clip per-sample grad L2 norm (for logging only)
         """
-        device = next(self.model.parameters()).device
         B = int(batch_size)
         preclip_norms = []
+        agg = _zeros_like_params(self.model)
 
-        # Accumulator for clipped per-sample gradients
-        agg = _clone_like_params(self.model)
-
-        # per-sample loop (plain but robust)
+        # per-sample loop
         for i in range(B):
-            self.optimizer.zero_grad(set_to_none=True)
+            self.opt.zero_grad(set_to_none=True)
             loss_per_sample[i].backward(retain_graph=(i < B - 1))
 
-            # Grab grads_i and compute its L2 norm
-            grads_i = _grad_list_from_model(self.model)
-            total = 0.0
+            grads_i = _grab_grads(self.model)
+
+            # L2 norm
+            tot = 0.0
             for g in grads_i:
                 if g is not None:
-                    total += g.pow(2).sum()
-            l2 = total.sqrt()
-            preclip_norms.append(float(l2.item()))
+                    tot += g.pow(2).sum()
+            l2 = float(tot.sqrt().item())
+            preclip_norms.append(l2)
 
-            # Clip & accumulate
-            coeff = min(1.0, self.C / (l2 + 1e-12))
-            for g, buf in zip(grads_i, agg):
-                if g is not None:
-                    if buf is None:
-                        continue
-                    buf.add_(g * coeff)
+            coef = min(1.0, self.C / (l2 + 1e-12))
+            for g, a in zip(grads_i, agg):
+                if g is not None and a is not None:
+                    a.add_(g * coef)
 
-        # Average over batch
-        _accumulate(agg, 1.0 / max(1, B))
+        # average
+        _scale_inplace(agg, 1.0 / max(1, B))
 
-        # Write averaged grads to .grad
-        self.optimizer.zero_grad(set_to_none=True)
-        for p, g in zip(self.model.parameters(), agg):
-            if p.requires_grad and g is not None:
-                p.grad = g.to(p.device)
+        # write averaged grads back
+        self.opt.zero_grad(set_to_none=True)
+        for p, a in zip(self.model.parameters(), agg):
+            if p.requires_grad and a is not None:
+                p.grad = a.to(p.device)
 
-        # Add Gaussian noise with std = sigma*C (per parameter)
-        self._add_noise()
+        # add noise on averaged grads
+        self._add_noise_on_average(B)
 
-        # Step
-        self.optimizer.step()
+        # update
+        self.opt.step()
 
-        # Return average pre-clip norm for logging
-        return float(np.mean(preclip_norms)) if preclip_norms else 0.0
+        return float(np.mean(preclip_norms)) if len(preclip_norms) else 0.0
 
 
-# --------------------------
-# Accuracy / IO helpers
-# --------------------------
+# ------------------- Eval helper -------------------
 def compute_accuracy(model: nn.Module, loader: torch.utils.data.DataLoader, device: torch.device) -> float:
     model.eval()
     correct = 0
@@ -217,7 +195,7 @@ def compute_accuracy(model: nn.Module, loader: torch.utils.data.DataLoader, devi
             out = model(x)
             if isinstance(out, tuple):
                 out = out[0]
-            pred = out.argmax(dim=1)
+            pred = out.argmax(1)
             correct += (pred == y).sum().item()
             total += y.numel()
     return correct / max(1, total)
