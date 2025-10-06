@@ -20,7 +20,8 @@ import torchvision.transforms as T
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
-from privacy.dp_utils import PrivacyAccountant, DPOptimizer, DataProcessor, compute_accuracy, solve_noise_from_epsilon
+from privacy.dp_utils import PrivacyAccountant, DPOptimizer, DataProcessor, compute_accuracy, \
+    solve_noise_from_epsilon, compute_epsilon_opacus, solve_noise_from_epsilon_opacus
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -299,13 +300,22 @@ def main():
     print(f"  Vehicle test: {len(m2_test)} batches")
     print(f"  Full test: {len(full_test)} batches")
     
-    # Resolve noise from epsilon if requested
-    if args.epsilon is not None:
-        # steps per epoch approximated by number of batches in training of each model; use 100 epochs baseline
-        # Here we use the 10-class steps as proxy: len(m1_train) ~ animal train; keep consistent across models
-        steps = 100 * len(full_test)  # approximate; conservative upper bound
-        args.noise_multiplier = solve_noise_from_epsilon(args.epsilon, args.delta, steps)
-        print(f"Solved noise_multiplier from epsilon={args.epsilon}: {args.noise_multiplier:.4f}")
+    # Helper: per-loader epsilon/noise utilities (accurate q, steps)
+    def get_q_steps(loader: DataLoader, epochs: int) -> Tuple[float, int]:
+        dataset_size = len(loader.dataset)
+        batch_size = loader.batch_size if loader.batch_size is not None else args.batch_size
+        q = batch_size / max(1, dataset_size)
+        steps = epochs * int(math.ceil(dataset_size / batch_size))
+        return q, steps
+
+    # Resolve noise from epsilon if requested (per task)
+    def resolve_noise_for_loader(loader: DataLoader, epochs: int) -> float:
+        if args.epsilon is None:
+            return args.noise_multiplier
+        q, steps = get_q_steps(loader, epochs)
+        nm = solve_noise_from_epsilon_opacus(args.epsilon, q, steps, args.delta)
+        print(f"Solved noise_multiplier from epsilon={args.epsilon} with q={q:.6f}, steps={steps}: {nm:.4f}")
+        return nm
 
     # Train models
     models = {}
@@ -316,9 +326,10 @@ def main():
         print("TRAINING 4-CLASS MODEL (Vehicle Classes)")
         print("="*50)
         model_4class = DP4Classifier(groups=8).to(DEVICE)
+        nm = resolve_noise_for_loader(m2_train, args.epochs_4class)
         acc, eps, delta = train_dp_model_paper(
             model_4class, m2_train, m2_test, args.epochs_4class, args.lr,
-            args.noise_multiplier, args.max_grad_norm, '4class', args.output_dir,
+            nm, args.max_grad_norm, '4class', args.output_dir,
             clip_constant=args.clip_constant
         )
         models['4class'] = model_4class
@@ -329,9 +340,10 @@ def main():
         print("TRAINING 6-CLASS MODEL (Animal Classes)")
         print("="*50)
         model_6class = DP6Classifier(groups=8).to(DEVICE)
+        nm = resolve_noise_for_loader(m1_train, args.epochs_6class)
         acc, eps, delta = train_dp_model_paper(
             model_6class, m1_train, m1_test, args.epochs_6class, args.lr,
-            args.noise_multiplier, args.max_grad_norm, '6class', args.output_dir,
+            nm, args.max_grad_norm, '6class', args.output_dir,
             clip_constant=args.clip_constant
         )
         models['6class'] = model_6class
@@ -342,9 +354,10 @@ def main():
         print("TRAINING 10-CLASS MODEL (Direct Training)")
         print("="*50)
         model_10class = DP10Classifier(groups=8).to(DEVICE)
+        nm = resolve_noise_for_loader(m1_train, args.epochs_10class)
         acc, eps, delta = train_dp_model_paper(
             model_10class, m1_train, m1_test, args.epochs_10class, args.lr,
-            args.noise_multiplier, args.max_grad_norm, '10class', args.output_dir,
+            nm, args.max_grad_norm, '10class', args.output_dir,
             clip_constant=args.clip_constant
         )
         models['10class'] = model_10class

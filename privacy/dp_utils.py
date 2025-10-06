@@ -8,6 +8,10 @@ import numpy as np
 from typing import Tuple, List, Dict, Optional
 import math
 from scipy import special
+try:
+    from opacus.accountants import RDPAccountant as OpacusRDPAccountant
+except Exception:
+    OpacusRDPAccountant = None
 
 
 class PrivacyAccountant:
@@ -60,6 +64,33 @@ def solve_noise_from_epsilon(target_epsilon: float, delta: float, steps: int) ->
         mid = (lo + hi) / 2
         acc = PrivacyAccountant(mid, batch_size=1, dataset_size=1)
         eps = acc.compute_epsilon(delta, steps)
+        if eps > target_epsilon:
+            lo = mid
+        else:
+            hi = mid
+    return hi
+
+
+def compute_epsilon_opacus(noise_multiplier: float, sample_rate: float, steps: int, delta: float) -> float:
+    """Compute epsilon using Opacus RDP accountant with given q and steps."""
+    if OpacusRDPAccountant is None:
+        # Fallback to simplified method
+        acc = PrivacyAccountant(noise_multiplier, batch_size=1, dataset_size=1)
+        return acc.compute_epsilon(delta, steps)
+    accountant = OpacusRDPAccountant()
+    for _ in range(steps):
+        accountant.step(noise_multiplier=noise_multiplier, sample_rate=sample_rate)
+    return accountant.get_epsilon(delta)
+
+
+def solve_noise_from_epsilon_opacus(target_epsilon: float, sample_rate: float, steps: int, delta: float) -> float:
+    """
+    Solve noise using Opacus accountant by binary search so that epsilon ~= target_epsilon.
+    """
+    lo, hi = 1e-3, 50.0
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        eps = compute_epsilon_opacus(mid, sample_rate, steps, delta)
         if eps > target_epsilon:
             lo = mid
         else:
