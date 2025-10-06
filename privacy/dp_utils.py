@@ -186,3 +186,47 @@ def compute_accuracy(model: nn.Module, data_loader: torch.utils.data.DataLoader,
             correct += pred.eq(target.view_as(pred)).sum().item()
             total += target.size(0)
     return correct / total
+
+# ============================================================
+# Per-sample DP-SGD Step
+# ============================================================
+def dp_step_images(model, optimizer, x, y, noise_multiplier: float, max_grad_norm: float) -> float:
+    """
+    Single DP-SGD step with per-sample gradient clipping + Gaussian noise.
+    Returns unclipped gradient norm before clipping.
+    """
+    model.train()
+    optimizer.zero_grad()
+
+    # Forward pass
+    logits = model(x)
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    loss = torch.nn.functional.cross_entropy(logits, y, reduction="none")
+
+    # Per-sample gradients
+    per_sample_grads = torch.autograd.grad(
+        outputs=loss,
+        inputs=list(model.parameters()),
+        grad_outputs=torch.ones_like(loss),
+        create_graph=False,
+        retain_graph=False,
+        only_inputs=True
+    )
+
+    # Compute per-sample gradient norms
+    grad_norms = torch.stack([g.view(g.size(0), -1).norm(2, dim=1) for g in per_sample_grads], dim=1).sum(dim=1)
+    mean_norm = grad_norms.mean().item()
+
+    # Clip gradients
+    clip_coef = (max_grad_norm / (grad_norms + 1e-6)).clamp(max=1.0)
+    for p, g in zip(model.parameters(), per_sample_grads):
+        clipped_grad = g * clip_coef.view(-1, *[1]*(g.dim()-1))
+        noise = torch.normal(0, noise_multiplier * max_grad_norm, size=p.shape, device=p.device)
+        p.grad = clipped_grad.mean(dim=0) + noise / x.size(0)
+
+    # Optimizer step
+    optimizer.step()
+
+    return mean_norm
+
