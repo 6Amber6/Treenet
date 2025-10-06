@@ -8,6 +8,7 @@ import torch.nn as nn
 import numpy as np
 from typing import Tuple, List, Dict
 import math
+import torch.nn.functional as F
 
 # Try importing Opacus accountant
 try:
@@ -207,43 +208,53 @@ def compute_accuracy(model: nn.Module, data_loader: torch.utils.data.DataLoader,
     return correct / total
 
 
+# ============================================================
+# DP-SGD Step with functorch
+# ============================================================
+from functorch import vmap, grad
+from torch.nn.utils.stateless import functional_call
+
 def dp_step_images(model, optimizer, x, y, noise_multiplier: float, max_grad_norm: float) -> float:
     """
     Perform a DP-SGD step with per-sample gradient clipping and Gaussian noise.
-    Returns the mean unclipped gradient norm before clipping.
+    Uses functorch.vmap for efficient per-sample gradient computation.
     """
     model.train()
     optimizer.zero_grad()
 
-    # Forward pass
-    logits = model(x)
-    if isinstance(logits, tuple):
-        logits = logits[0]
-    loss = torch.nn.functional.cross_entropy(logits, y, reduction="none")
+    # Get model parameters and buffers
+    params = {k: v for k, v in model.named_parameters()}
+    buffers = dict(model.named_buffers())
 
-    # Per-sample gradients
-    per_sample_grads = torch.autograd.grad(
-        outputs=loss,
-        inputs=list(model.parameters()),
-        grad_outputs=torch.ones_like(loss),
-        create_graph=False,
-        retain_graph=False,
-        only_inputs=True
-    )
+    # Define single-sample loss
+    def loss_single(params, buffers, x_i, y_i):
+        logits = functional_call(model, (params, buffers), (x_i.unsqueeze(0),))
+        if isinstance(logits, tuple):
+            logits = logits[0]
+        return F.cross_entropy(logits, y_i.unsqueeze(0), reduction="mean")
 
-    # Compute per-sample gradient norms correctly
-    grad_norms = []
-    for g in per_sample_grads:
-        grad_norms.append(g.view(g.size(0), -1).pow(2).sum(dim=1))  # [batch_size]
-    grad_norms = torch.stack(grad_norms, dim=0).sum(dim=0).sqrt()   # [batch_size]
+    # Vectorize gradient computation across the batch
+    grad_fn = grad(loss_single)
+    per_sample_grads = vmap(grad_fn, in_dims=(None, None, 0, 0))(params, buffers, x, y)
+
+    # Compute per-sample gradient norms
+    per_sample_norms = []
+    for g in per_sample_grads.values():
+        g_flat = g.view(g.size(0), -1)
+        per_sample_norms.append(g_flat.pow(2).sum(dim=1))
+    grad_norms = torch.stack(per_sample_norms, dim=1).sum(dim=1).sqrt()
     mean_norm = grad_norms.mean().item()
 
-    # Clip gradients
+    # Clip and add noise
     clip_coef = (max_grad_norm / (grad_norms + 1e-6)).clamp(max=1.0)
-    for p, g in zip(model.parameters(), per_sample_grads):
-        clipped_grad = g * clip_coef.view(-1, *[1]*(g.dim()-1))
-        noise = torch.normal(0, noise_multiplier * max_grad_norm, size=p.shape, device=p.device)
-        p.grad = clipped_grad.mean(dim=0) + noise / x.size(0)
+    for name, p in model.named_parameters():
+        if p.requires_grad:
+            g = per_sample_grads[name]
+            clipped = g * clip_coef.view(-1, *[1] * (g.dim() - 1))
+            noise = torch.normal(
+                0, noise_multiplier * max_grad_norm, size=p.shape, device=p.device
+            )
+            p.grad = clipped.mean(dim=0) + noise / x.size(0)
 
     optimizer.step()
     return mean_norm
