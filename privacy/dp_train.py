@@ -1,15 +1,14 @@
 """
-Per-sample DP-SGD training:
-- 4-class (vehicles), 6-class (animals), 10-class baseline, and Fusion
-- Correct epsilon accounting via Opacus (if available)
+Per-sample DP-SGD training with vectorized per-sample gradients (torch.func.vmap)
+- Compare: 4-class (vehicles), 6-class (animals), 10-class baseline, and Fusion
 """
 
 import os, sys, json, math
-from typing import List, Tuple, Dict
+from typing import List, Dict, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
-from torch import nn
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
@@ -50,7 +49,8 @@ def get_filtered_loaders(data_dir: str, keep_labels: List[int], batch_size: int,
         idx = []
         for i in range(len(ds)):
             _, y = ds[i]
-            if int(y) in keep: idx.append(i)
+            if int(y) in keep:
+                idx.append(i)
         return torch.utils.data.Subset(ds, idx)
 
     tr_sub = subset(full_train.dataset, keep_labels)
@@ -85,8 +85,8 @@ def train_dp(model: nn.Module,
              delta: float,
              model_name: str,
              outdir: str):
-    print(f"\nTraining {model_name} with per-sample DP-SGD...")
 
+    print(f"\nTraining {model_name} with vectorized per-sample DP-SGD...")
     base_opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4)
     dp_opt = DPOptimizer(model, base_opt, noise_multiplier=noise_multiplier, max_grad_norm=max_grad_norm)
 
@@ -95,17 +95,18 @@ def train_dp(model: nn.Module,
     model.train()
 
     for ep in range(epochs):
-        correct = 0
-        total = 0
-
+        correct, total = 0, 0
         for b, (x, y) in enumerate(train_loader):
             x, y = x.to(DEVICE), y.to(DEVICE)
+
+            # forward once for metrics (not used for grads)
             out = model(x)
             logits = out[0] if isinstance(out, tuple) else out
-            loss_i = F.cross_entropy(logits, y, reduction='none')
+            loss_mean = F.cross_entropy(logits, y, reduction='mean').item()
 
+            # DP-SGD step (vectorized per-sample grads)
             dp_opt.zero_grad()
-            pre = dp_opt.dp_step(loss_i, batch_size=y.size(0))
+            pre = dp_opt.dp_step_images(x, y)
             steps += 1
 
             with torch.no_grad():
@@ -116,11 +117,11 @@ def train_dp(model: nn.Module,
             if b % 50 == 0:
                 q = (train_loader.batch_size or 1) / max(1, len(train_loader.dataset))
                 eps = compute_epsilon_opacus(noise_multiplier, q, steps, delta)
-                print(f"Epoch {ep}, Batch {b}, Loss(mean) {loss_i.mean().item():.4f}, "
-                      f"PreClip||g|| {pre:.2f}, ε={eps:.3f}, δ={delta:.1e}")
+                print(f"Epoch {ep}, Batch {b}, Loss(mean) {loss_mean:.4f}, PreClip||g|| {pre:.2f}, "
+                      f"ε={eps:.3f}, δ={delta:.1e}")
 
         train_acc = correct / max(1, total)
-        test_acc = compute_accuracy(model, test_loader, DEVICE)
+        test_acc  = compute_accuracy(model, test_loader, DEVICE)
         q = (train_loader.batch_size or 1) / max(1, len(train_loader.dataset))
         eps = compute_epsilon_opacus(noise_multiplier, q, steps, delta)
         print(f"Epoch {ep}: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, Privacy ε={eps:.3f}, δ={delta:.1e}")
@@ -148,7 +149,7 @@ def extract_embeddings(model: nn.Module, loader: DataLoader):
 
 def train_fusion(model4, model6, full_train, full_test,
                  epochs, lr, noise_multiplier, max_grad_norm, delta, outdir):
-    print("\nTraining FUSION with per-sample DP-SGD...")
+    print("\nTraining FUSION with vectorized per-sample DP-SGD...")
 
     emb4, y4 = extract_embeddings(model4, full_train)
     emb6, y6 = extract_embeddings(model6, full_train)
@@ -171,15 +172,17 @@ def train_fusion(model4, model6, full_train, full_test,
     fusion.train()
 
     for ep in range(epochs):
-        correct = 0
-        total = 0
+        correct, total = 0, 0
         for b, (e4, e6, y) in enumerate(floader):
             e4, e6, y = e4.to(DEVICE), e6.to(DEVICE), y.to(DEVICE)
-            logits = fusion(e4, e6)           # fusion 模型接收两份 embedding
-            loss_i = F.cross_entropy(logits, y, reduction='none')
 
+            # metrics forward
+            logits = fusion(e4, e6)
+            loss_mean = F.cross_entropy(logits, y, reduction='mean').item()
+
+            # DP-SGD step
             dp_opt.zero_grad()
-            pre = dp_opt.dp_step(loss_i, batch_size=y.size(0))
+            pre = dp_opt.dp_step_fusion(e4, e6, y)
             steps += 1
 
             with torch.no_grad():
@@ -190,7 +193,7 @@ def train_fusion(model4, model6, full_train, full_test,
             if b % 50 == 0:
                 q = (floader.batch_size or 1) / max(1, len(fds))
                 eps = compute_epsilon_opacus(noise_multiplier, q, steps, delta)
-                print(f"[Fusion] Epoch {ep}, Batch {b}, Loss(mean) {loss_i.mean().item():.4f}, "
+                print(f"[Fusion] Epoch {ep}, Batch {b}, Loss(mean) {loss_mean:.4f}, "
                       f"PreClip||g|| {pre:.2f}, ε={eps:.3f}")
 
         train_acc = correct / max(1, total)
@@ -213,12 +216,12 @@ def estimate_steps(epochs: int, n: int, b: int) -> int:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser("Per-sample DP-SGD (hierarchical vs baseline)")
+    parser = argparse.ArgumentParser("Vectorized per-sample DP-SGD (hierarchical vs baseline)")
     parser.add_argument('--data_dir', type=str, default='./data')
     parser.add_argument('--output_dir', type=str, default='./results_all')
     parser.add_argument('--batch_size', type=int, default=128)
     parser.add_argument('--num_workers', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=0.01)  # 稍微降低，DP更稳
+    parser.add_argument('--lr', type=float, default=0.01)
 
     parser.add_argument('--epochs_4class', type=int, default=50)
     parser.add_argument('--epochs_6class', type=int, default=50)
@@ -254,8 +257,7 @@ def main():
     m4_train, m4_test = get_filtered_loaders(args.data_dir, vehicles, args.batch_size, args.num_workers)
 
     def q_steps(loader, epochs):
-        n = len(loader.dataset)
-        b = loader.batch_size or args.batch_size
+        n = len(loader.dataset); b = loader.batch_size or args.batch_size
         return b / max(1, n), estimate_steps(epochs, n, b)
 
     def sigma_for(loader, epochs):
@@ -287,7 +289,7 @@ def main():
         results["6class"] = {"accuracy": acc, "epsilon": eps, "delta": delt}
         models["6class"] = model6
 
-    # 10-class baseline (Full CIFAR-10)
+    # 10-class baseline
     if args.train_all or args.train_10class:
         model10 = DP10Classifier(groups=8).to(DEVICE)
         sigma10 = sigma_for(full_train, args.epochs_10class)
@@ -295,7 +297,7 @@ def main():
                                   sigma10, args.max_grad_norm, args.delta, "10class", args.output_dir)
         results["10class"] = {"accuracy": acc, "epsilon": eps, "delta": delt}
 
-    # Fusion (Full CIFAR-10 labels)
+    # Fusion
     if args.train_all or args.train_fusion:
         if "4class" in models and "6class" in models:
             sigmaF = sigma_for(full_train, args.epochs_fusion)
