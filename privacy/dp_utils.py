@@ -1,5 +1,6 @@
 """
-Utilities for DP-SGD training including privacy accounting and data processing
+Utilities for DP-SGD training including privacy accounting,
+gradient clipping, dataset processing, and per-sample DP-SGD step.
 """
 
 import torch
@@ -8,7 +9,7 @@ import numpy as np
 from typing import Tuple, List, Dict
 import math
 
-# 尝试导入 Opacus 的 RDPAccountant
+# Try importing Opacus accountant
 try:
     from opacus.accountants import RDPAccountant as OpacusRDPAccountant
 except Exception:
@@ -19,7 +20,7 @@ except Exception:
 # Privacy Accountant
 # ============================================================
 class PrivacyAccountant:
-    """Privacy accountant for DP-SGD using RDP (Renyi Differential Privacy)"""
+    """Privacy accountant for DP-SGD using RDP (Renyi Differential Privacy)."""
     
     def __init__(self, noise_multiplier: float, batch_size: int, dataset_size: int):
         self.noise_multiplier = noise_multiplier
@@ -28,11 +29,13 @@ class PrivacyAccountant:
         self.sampling_rate = batch_size / dataset_size
         
     def compute_rdp(self, alpha: float) -> float:
+        """Compute RDP for Gaussian mechanism at order alpha."""
         if self.noise_multiplier == 0:
             return float("inf")
         return alpha / (2 * self.noise_multiplier ** 2)
     
     def compute_epsilon(self, delta: float, steps: int) -> float:
+        """Compute epsilon from RDP given delta and steps."""
         if self.noise_multiplier == 0:
             return float("inf")
         alphas = np.arange(2, 100, 0.5)
@@ -44,12 +47,13 @@ class PrivacyAccountant:
         return min(epsilons)
     
     def get_privacy_spent(self, steps: int, delta: float = 1e-5) -> Tuple[float, float]:
+        """Return (epsilon, delta) spent after given number of steps."""
         epsilon = self.compute_epsilon(delta, steps)
         return epsilon, delta
 
 
 def solve_noise_from_epsilon(target_epsilon: float, delta: float, steps: int) -> float:
-    """二分搜索求 noise multiplier"""
+    """Binary search for noise multiplier given target epsilon."""
     lo, hi = 1e-3, 50.0
     for _ in range(40):
         mid = (lo + hi) / 2
@@ -63,14 +67,14 @@ def solve_noise_from_epsilon(target_epsilon: float, delta: float, steps: int) ->
 
 
 # ============================================================
-# Opacus-based epsilon计算
+# Opacus-based epsilon computation
 # ============================================================
 def compute_epsilon_opacus(noise_multiplier: float, sample_rate: float, steps: int, delta: float) -> float:
     """
-    Compute epsilon using Opacus RDP accountant with given q and steps.
+    Compute epsilon using Opacus RDP accountant.
+    Falls back to simplified formula if Opacus is not available.
     """
     if OpacusRDPAccountant is None:
-        # fallback 简单公式
         return (steps * (sample_rate ** 2)) / (2 * noise_multiplier ** 2) + math.log(1/delta)
 
     accountant = OpacusRDPAccountant()
@@ -80,7 +84,7 @@ def compute_epsilon_opacus(noise_multiplier: float, sample_rate: float, steps: i
 
 
 def solve_noise_from_epsilon_opacus(target_epsilon: float, sample_rate: float, steps: int, delta: float) -> float:
-    """二分搜索，利用 Opacus 来解 noise multiplier"""
+    """Binary search for noise multiplier using Opacus accountant."""
     lo, hi = 1e-3, 50.0
     for _ in range(40):
         mid = (lo + hi) / 2
@@ -93,9 +97,10 @@ def solve_noise_from_epsilon_opacus(target_epsilon: float, sample_rate: float, s
 
 
 # ============================================================
-# Gradient clipping utilities
+# Gradient Clipping Utility
 # ============================================================
 class GradientClipper:
+    """Utility for clipping gradients by L2 norm."""
     def __init__(self, max_norm: float = 1.0):
         self.max_norm = max_norm
     
@@ -114,10 +119,10 @@ class GradientClipper:
 
 
 # ============================================================
-# Data utilities
+# CIFAR-10 Data Utilities
 # ============================================================
 class DataProcessor:
-    """CIFAR-10 数据处理工具"""
+    """CIFAR-10 dataset processing utilities."""
     
     @staticmethod
     def get_cifar10_classes() -> Dict[str, List[int]]:
@@ -128,9 +133,22 @@ class DataProcessor:
         }
     
     @staticmethod
-    def filter_dataset(dataset, target_classes: List[int]) -> torch.utils.data.Subset:
-        indices = [idx for idx, (_, label) in enumerate(dataset) if label in target_classes]
-        return torch.utils.data.Subset(dataset, indices)
+    def filter_dataset(dataset, target_classes: List[int]) -> torch.utils.data.Dataset:
+        """
+        Filter dataset to keep only given classes.
+        Also remap labels to 0..N-1 to match classifier output size.
+        """
+        class_to_idx = {cls: i for i, cls in enumerate(target_classes)}
+        indices, new_targets = [], []
+
+        for idx, (_, label) in enumerate(dataset):
+            if label in target_classes:
+                indices.append(idx)
+                new_targets.append(class_to_idx[label])
+
+        subset = torch.utils.data.Subset(dataset, indices)
+        subset.targets = torch.tensor(new_targets)  # attach remapped labels
+        return subset
     
     @staticmethod
     def create_data_loaders(data_dir: str, batch_size: int = 64, num_workers: int = 4) -> Dict:
@@ -171,9 +189,10 @@ class DataProcessor:
 
 
 # ============================================================
-# Accuracy
+# Accuracy Computation
 # ============================================================
 def compute_accuracy(model: nn.Module, data_loader: torch.utils.data.DataLoader, device: torch.device) -> float:
+    """Compute accuracy of a model on a dataset."""
     model.eval()
     correct, total = 0, 0
     with torch.no_grad():
@@ -187,13 +206,14 @@ def compute_accuracy(model: nn.Module, data_loader: torch.utils.data.DataLoader,
             total += target.size(0)
     return correct / total
 
+
 # ============================================================
 # Per-sample DP-SGD Step
 # ============================================================
 def dp_step_images(model, optimizer, x, y, noise_multiplier: float, max_grad_norm: float) -> float:
     """
-    Single DP-SGD step with per-sample gradient clipping + Gaussian noise.
-    Returns unclipped gradient norm before clipping.
+    Perform a DP-SGD step with per-sample gradient clipping and Gaussian noise.
+    Returns the mean unclipped gradient norm before clipping.
     """
     model.train()
     optimizer.zero_grad()
@@ -225,8 +245,5 @@ def dp_step_images(model, optimizer, x, y, noise_multiplier: float, max_grad_nor
         noise = torch.normal(0, noise_multiplier * max_grad_norm, size=p.shape, device=p.device)
         p.grad = clipped_grad.mean(dim=0) + noise / x.size(0)
 
-    # Optimizer step
     optimizer.step()
-
     return mean_norm
-
