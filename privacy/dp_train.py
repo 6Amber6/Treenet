@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import torchvision
 import torchvision.transforms as T
+import math
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -125,11 +126,6 @@ def train_dp_model_paper(model: nn.Module, train_loader: DataLoader, test_loader
         noise_multiplier, max_grad_norm, momentum_beta=0.0, clip_constant=clip_constant
     )
     
-    # Create privacy accountant
-    privacy_accountant = PrivacyAccountant(
-        noise_multiplier, len(train_loader.dataset), len(train_loader.dataset)
-    )
-    
     # Loss function
     criterion = nn.CrossEntropyLoss()
     
@@ -172,9 +168,13 @@ def train_dp_model_paper(model: nn.Module, train_loader: DataLoader, test_loader
         train_acc = correct / total
         test_acc = compute_accuracy(model, test_loader, DEVICE)
         
-        # Compute privacy spent
-        steps = epoch * len(train_loader)
-        epsilon, delta = privacy_accountant.get_privacy_spent(steps, 1e-5)
+        # Compute privacy spent (Opacus RDP with accurate q and steps)
+        dataset_size = len(train_loader.dataset)
+        batch_size_eff = train_loader.batch_size if train_loader.batch_size is not None else 1
+        sample_rate = batch_size_eff / max(1, dataset_size)
+        steps_cumulative = (epoch + 1) * int(math.ceil(dataset_size / batch_size_eff))
+        epsilon = compute_epsilon_opacus(noise_multiplier, sample_rate, steps_cumulative, 1e-5)
+        delta = 1e-5
         
         print(f'Epoch {epoch}: Train Acc: {train_acc:.4f}, Test Acc: {test_acc:.4f}, '
               f'Privacy: ε={epsilon:.3f}, δ={delta:.2e}')
