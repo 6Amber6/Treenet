@@ -273,9 +273,11 @@ def main():
     # Create output directory
     os.makedirs(args.output_dir, exist_ok=True)
     
-    # Define classes (strictly following paper requirements)
-    animal_classes = [0, 1, 2, 3, 4, 5]  # airplane, automobile, bird, cat, deer, dog
-    vehicle_classes = [6, 7, 8, 9]  # frog, horse, ship, truck
+    # Define classes (CIFAR-10 index mapping)
+    # Animals: bird(2), cat(3), deer(4), dog(5), frog(6), horse(7)
+    # Vehicles: airplane(0), automobile(1), ship(8), truck(9)
+    animal_classes = [2, 3, 4, 5, 6, 7]
+    vehicle_classes = [0, 1, 8, 9]
     
     print("="*60)
     print("PAPER-COMPLIANT DP-SGD TRAINING")
@@ -288,7 +290,7 @@ def main():
     
     # Create data loaders
     print("\nLoading data...")
-    _, full_test = get_cifar10_loaders(args.data_dir, args.batch_size, args.num_workers)
+    full_train, full_test = get_cifar10_loaders(args.data_dir, args.batch_size, args.num_workers)
     
     m1_train, m1_test = get_filtered_loaders(args.data_dir, animal_classes, args.batch_size, args.num_workers)
     m2_train, m2_test = get_filtered_loaders(args.data_dir, vehicle_classes, args.batch_size, args.num_workers)
@@ -354,9 +356,9 @@ def main():
         print("TRAINING 10-CLASS MODEL (Direct Training)")
         print("="*50)
         model_10class = DP10Classifier(groups=8).to(DEVICE)
-        nm = resolve_noise_for_loader(m1_train, args.epochs_10class)
+        nm = resolve_noise_for_loader(full_train, args.epochs_10class)
         acc, eps, delta = train_dp_model_paper(
-            model_10class, m1_train, m1_test, args.epochs_10class, args.lr,
+            model_10class, full_train, full_test, args.epochs_10class, args.lr,
             nm, args.max_grad_norm, '10class', args.output_dir,
             clip_constant=args.clip_constant
         )
