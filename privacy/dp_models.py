@@ -38,7 +38,7 @@ class BasicBlock(nn.Module):
         out = F.relu(self.gn1(self.conv1(x)))
         out = self.gn2(self.conv2(out))
         out = out + self.shortcut(x)   
-        out = self.relu(out)
+        out = F.relu(out)
         return out
 
 
