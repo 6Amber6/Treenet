@@ -92,7 +92,7 @@ def main():
     parser.add_argument("--data_dir", type=str, default="./data")
     parser.add_argument("--output_dir", type=str, default="./results_all")
     parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.01")
+    parser.add_argument("--lr", type=float, default=0.01)
     parser.add_argument("--epochs_4class", type=int, default=50)
     parser.add_argument("--epochs_6class", type=int, default=50)
     parser.add_argument("--epochs_10class", type=int, default=50)
