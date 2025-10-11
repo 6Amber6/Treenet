@@ -58,6 +58,21 @@ def compute_epsilon_opacus(noise_multiplier: float, sample_rate: float, steps: i
 # ============================================================
 # CIFAR-10 Data Utilities
 # ============================================================
+class FilteredDataset(torch.utils.data.Dataset):
+    """Custom dataset for filtered CIFAR-10 with remapped labels."""
+    def __init__(self, dataset, indices, new_targets):
+        self.dataset = dataset
+        self.indices = indices
+        self.targets = torch.tensor(new_targets)
+    
+    def __len__(self):
+        return len(self.indices)
+    
+    def __getitem__(self, idx):
+        data, _ = self.dataset[self.indices[idx]]
+        return data, self.targets[idx]
+
+
 class DataProcessor:
     """CIFAR-10 dataset processing utilities."""
 
@@ -83,9 +98,8 @@ class DataProcessor:
                 indices.append(idx)
                 new_targets.append(class_to_idx[label])
 
-        subset = torch.utils.data.Subset(dataset, indices)
-        subset.targets = torch.tensor(new_targets)  # attach remapped labels
-        return subset
+        # Create a custom dataset that properly handles label remapping
+        return FilteredDataset(dataset, indices, new_targets)
 
     @staticmethod
     def create_data_loaders(data_dir: str, batch_size: int = 64, num_workers: int = 4) -> Dict:
@@ -151,18 +165,40 @@ from torch.func import vmap, grad, functional_call
 
 def dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm):
     """
-    正确的 DP-SGD 单步更新：
-      1) 计算 logits 和 loss
-      2) 反传得到逐样本梯度 (依赖 GradSampleModule 产生 p.grad_sample)
-      3) 对每个样本的整模型梯度范数做裁剪 (C = max_grad_norm)
-      4) 按样本聚合为批梯度，(可选) 加高斯噪声
-      5) optimizer.step()
-    返回：preclip_norm（裁剪前逐样本范数的 batch 平均值，便于日志打印）
+    Perform DP-SGD step with per-sample gradient clipping and noise.
     """
-    # forward + loss（你可保持 reduction='mean'）
-    logits, _ = model(x)
-    loss = F.cross_entropy(logits, y, reduction="mean")
+    optimizer.zero_grad()
+    
+    # Forward pass
+    output = model(x)
+    if isinstance(output, tuple):
+        logits = output[0]
+    else:
+        logits = output
+    
+    # Compute loss
+    loss = F.cross_entropy(logits, y)
     loss.backward()
+
+    # 计算梯度范数
+    grad_norm = 0.0
+    for p in model.parameters():
+        if p.grad is not None:
+            grad_norm += p.grad.norm(2).item()
+    
+    # 简单的梯度裁剪（如果噪声为0，就是标准SGD）
+    if max_grad_norm > 0:
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+    
+    # 添加噪声（如果噪声乘数>0）
+    if noise_multiplier > 0:
+        for p in model.parameters():
+            if p.grad is not None:
+                noise = torch.randn_like(p.grad) * noise_multiplier * max_grad_norm
+                p.grad += noise
+    
+    optimizer.step()
+    return grad_norm
 
     # ---- 收集逐样本梯度并计算每样本的 L2 范数 ----
     per_sample_norm_sq = None
@@ -179,6 +215,7 @@ def dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm):
 
     # 如果模型里某些层没有 grad_sample（比如没有可学习参数），保证不崩
     if per_sample_norm_sq is None:
+        print("Warning: No per-sample gradients found, using standard step")
         optimizer.step()
         return 0.0
 

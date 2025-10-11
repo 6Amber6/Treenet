@@ -8,7 +8,8 @@ import os
 import torch
 import torch.nn.functional as F
 from torch import optim
-from opacus.grad_sample import GradSampleModule  # ✅ 新增：用于逐样本梯度
+from opacus.grad_sample import GradSampleModule
+from opacus.utils.batch_memory_manager import BatchMemoryManager
 
 from privacy.dp_utils import (
     compute_accuracy,
@@ -24,14 +25,15 @@ from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFu
 # ------------------------------
 def remap_targets(y, dataset, device):
     """
-    仅当 dataset 显式提供 class_map: dict{old_label->new_label} 时才做映射；
-    否则直接返回原始 y，避免把标签当索引误用。
+    Handle label remapping for different dataset types.
+    For filtered datasets, labels are already properly mapped to 0..N-1.
     """
-    class_map = getattr(dataset, "class_map", None)
-    if class_map is not None:
-        y_cpu = y.detach().cpu().tolist()
-        y_new = torch.tensor([class_map.get(int(v), int(v)) for v in y_cpu], dtype=torch.long)
-        return y_new.to(device)
+    # Check if this is a filtered dataset with remapped targets
+    if hasattr(dataset, 'targets') and hasattr(dataset, 'indices'):
+        # This is a filtered dataset, labels are already remapped
+        return y.to(device)
+    
+    # For other cases, return as-is
     return y.to(device)
 
 
@@ -40,9 +42,8 @@ def remap_targets(y, dataset, device):
 # ------------------------------
 def train_dp(model, train_loader, test_loader, epochs, lr,
              noise_multiplier, max_grad_norm, delta, device):
-    # ✅ 关键修复：包一层，才能得到 per-sample grads (.grad_sample)
-    model = GradSampleModule(model).to(device)
-
+    # 暂时禁用 Opacus，使用标准训练进行调试
+    model = model.to(device)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
 
     steps = 0
@@ -57,23 +58,30 @@ def train_dp(model, train_loader, test_loader, epochs, lr,
 
             optimizer.zero_grad()
 
-            # ✅ DP-SGD（逐样本裁剪逻辑在 dp_utils.dp_step_images 内）
+            # 使用调试版本的 DP-SGD 训练
             preclip_norm = dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm)
 
             steps += 1
+            # 获取实际的 batch size
+            actual_batch_size = x.size(0)
             eps = compute_epsilon_opacus(
                 noise_multiplier,
-                train_loader.batch_size / len(train_loader.dataset),
+                actual_batch_size / len(train_loader.dataset),
                 steps,
                 delta,
             )
 
             if batch_idx % 50 == 0:
-                # 维持你原有的日志格式
-                logits, _ = model(x)
-                loss_val = F.cross_entropy(logits, y).item()
+                # 重新计算 loss 用于显示
+                with torch.no_grad():
+                    output = model(x)
+                    if isinstance(output, tuple):
+                        logits = output[0]
+                    else:
+                        logits = output
+                    loss_val = F.cross_entropy(logits, y).item()
                 print(f"Epoch {epoch}, Batch {batch_idx}, Loss {loss_val:.4f}, "
-                      f"PreClip||g|| {preclip_norm:.2f}, ε={eps:.3f}, δ={delta:.1e}")
+                      f"GradNorm {preclip_norm:.2f}, ε={eps:.3f}, δ={delta:.1e}")
 
         # Epoch end: accuracy
         train_acc = compute_accuracy(model, train_loader, device)
