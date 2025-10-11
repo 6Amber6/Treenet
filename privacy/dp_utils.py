@@ -165,77 +165,48 @@ from torch.func import vmap, grad, functional_call
 
 def dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm):
     """
-    Perform DP-SGD step with per-sample gradient clipping and noise.
+    纯 PyTorch 实现的 DP-SGD 步骤：
+    - 每样本梯度计算 (torch.func.vmap)
+    - 逐样本 L2 裁剪
+    - 聚合 + 加噪声
     """
+    from torch.func import vmap, grad, functional_call
+    model.train()
     optimizer.zero_grad()
-    
-    # Forward pass
-    output = model(x)
-    if isinstance(output, tuple):
-        logits = output[0]
-    else:
-        logits = output
-    
-    # Compute loss
-    loss = F.cross_entropy(logits, y)
-    loss.backward()
 
-    # 计算梯度范数
-    grad_norm = 0.0
-    for p in model.parameters():
-        if p.grad is not None:
-            grad_norm += p.grad.norm(2).item()
-    
-    # 简单的梯度裁剪（如果噪声为0，就是标准SGD）
-    if max_grad_norm > 0:
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-    
-    # 添加噪声（如果噪声乘数>0）
-    if noise_multiplier > 0:
-        for p in model.parameters():
-            if p.grad is not None:
-                noise = torch.randn_like(p.grad) * noise_multiplier * max_grad_norm
-                p.grad += noise
-    
-    optimizer.step()
-    return grad_norm
+    # 定义 loss 函数
+    def compute_loss(params, buffers, sample_x, sample_y):
+        logits = functional_call(model, (params, buffers), (sample_x.unsqueeze(0),))
+        logits = logits[0] if isinstance(logits, tuple) else logits
+        return F.cross_entropy(logits, sample_y.unsqueeze(0))
 
-    # ---- 收集逐样本梯度并计算每样本的 L2 范数 ----
-    per_sample_norm_sq = None
-    params_with_gs = []
+    params = {k: v for k, v in model.named_parameters() if v.requires_grad}
+    buffers = {k: v for k, v in model.named_buffers()}
 
-    for p in model.parameters():
-        gs = getattr(p, "grad_sample", None)   # gs 形状 [B, ...]
-        if gs is None:
+    # 计算逐样本梯度 [B, ...]
+    grads = vmap(grad(compute_loss), in_dims=(None, None, 0, 0))(params, buffers, x, y)
+
+    # 计算每个样本的梯度范数
+    per_sample_norms = torch.zeros(x.size(0), device=x.device)
+    for p in grads.values():
+        per_sample_norms += p.view(p.shape[0], -1).pow(2).sum(dim=1)
+    per_sample_norms = per_sample_norms.sqrt()
+
+    # 逐样本裁剪
+    scales = (max_grad_norm / (per_sample_norms + 1e-12)).clamp(max=1.0)
+    for k, p in grads.items():
+        grads[k] = p * scales.view(-1, *([1] * (p.ndim - 1)))
+
+    # 聚合 + 加噪
+    for (name, param) in model.named_parameters():
+        if not param.requires_grad:
             continue
-        params_with_gs.append(p)
-        gsv = gs.view(gs.shape[0], -1)         # [B, D]
-        cur = (gsv ** 2).sum(dim=1)            # [B]
-        per_sample_norm_sq = cur if per_sample_norm_sq is None else per_sample_norm_sq + cur
-
-    # 如果模型里某些层没有 grad_sample（比如没有可学习参数），保证不崩
-    if per_sample_norm_sq is None:
-        print("Warning: No per-sample gradients found, using standard step")
-        optimizer.step()
-        return 0.0
-
-    per_sample_norms = per_sample_norm_sq.sqrt()  # [B]
-    B = per_sample_norms.shape[0]
-    preclip_norm = per_sample_norms.mean().item()
-
-    # ---- 计算逐样本缩放系数：min(1, C / ||g_i||) ----
-    scales = (max_grad_norm / (per_sample_norms + 1e-12)).clamp(max=1.0)  # [B]
-
-    # ---- 按样本裁剪 → 聚合 → (可选)加噪声 → 设定 p.grad ----
-    for p in params_with_gs:
-        gs = p.grad_sample  # [B, ...]
-        gs = (gs.view(B, -1) * scales.view(B, 1)).view_as(gs)  # 逐样本缩放
-        summed = gs.sum(dim=0)  # 聚合到参数维度
+        grad_stack = grads[name]
+        grad_sum = grad_stack.sum(dim=0)
         if noise_multiplier > 0:
-            noise = torch.randn_like(summed) * noise_multiplier * max_grad_norm
-            summed = summed + noise
-        p.grad = summed / B    # 设定最终梯度（批平均）
-        del p.grad_sample      # 释放显存
+            noise = torch.randn_like(grad_sum) * noise_multiplier * max_grad_norm
+            grad_sum = grad_sum + noise
+        param.grad = grad_sum / x.size(0)
 
     optimizer.step()
-    return preclip_norm
+    return per_sample_norms.mean().item()
