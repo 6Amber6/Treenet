@@ -16,6 +16,7 @@ from privacy.dp_utils import (
     compute_epsilon_opacus,
     DataProcessor,
     dp_step_images,
+    get_std,   # ✅ 新增导入
 )
 from privacy.dp_models import DP4Classifier, DP6Classifier, DP10Classifier, DPFusionModel
 
@@ -108,12 +109,25 @@ def main():
     parser.add_argument("--noise_multiplier", type=float, default=1.1)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
     parser.add_argument("--delta", type=float, default=1e-5)
+    parser.add_argument("--epsilon", type=float, default=None,  # ✅ 新增参数
+                        help="Target ε for automatic noise multiplier computation")
     parser.add_argument("--train_all", action="store_true")
     parser.add_argument("--train_4class", action="store_true")
     parser.add_argument("--train_6class", action="store_true")
     parser.add_argument("--train_10class", action="store_true")
     parser.add_argument("--train_fusion", action="store_true")
     args = parser.parse_args()
+
+    # ✅ 如果用户传入 epsilon，就自动计算 noise_multiplier
+    if args.epsilon is not None:
+        q = args.batch_size / 50000.0  # CIFAR-10 默认训练样本数
+        args.noise_multiplier = get_std(
+            q=q,
+            EPOCH=args.epochs_4class,
+            epsilon=args.epsilon,
+            delta=args.delta,
+            verbose=True
+        )
 
     os.makedirs(args.output_dir, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
