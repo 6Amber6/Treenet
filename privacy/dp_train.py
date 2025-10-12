@@ -41,55 +41,96 @@ def remap_targets(y, dataset, device):
 # ------------------------------
 # Training loop with per-sample DP-SGD
 # ------------------------------
-def train_dp(model, train_loader, test_loader, epochs, lr,
-             noise_multiplier, max_grad_norm, delta, device):
-    # 暂时禁用 Opacus，使用标准训练进行调试
+def train_dp(model, train_loader, test_loader, total_iterations, lr,
+             noise_multiplier, max_grad_norm, delta, device, sampling_rate=0.05):
+    """
+    DP-SGD training with fixed sampling rate and total iterations.
+    
+    Args:
+        model: Model to train
+        train_loader: Training data loader
+        test_loader: Test data loader  
+        total_iterations: Total number of DP-SGD iterations (T_1 + T_3)
+        lr: Learning rate
+        noise_multiplier: Noise multiplier σ
+        max_grad_norm: Clipping constant C
+        delta: Privacy parameter δ
+        device: Device to use
+        sampling_rate: Sampling rate q (default 0.05)
+    """
     model = model.to(device)
     optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9)
 
+    # Calculate batch size from sampling rate
+    dataset_size = len(train_loader.dataset)
+    batch_size = int(sampling_rate * dataset_size)
+    
+    # Create new data loader with calculated batch size
+    from torch.utils.data import DataLoader
+    new_train_loader = DataLoader(
+        train_loader.dataset, 
+        batch_size=batch_size, 
+        shuffle=True, 
+        num_workers=train_loader.num_workers,
+        pin_memory=train_loader.pin_memory
+    )
+    
+    print(f"Training with sampling_rate={sampling_rate:.3f}, batch_size={batch_size}, total_iterations={total_iterations}")
+    
     steps = 0
     eps = 0.0
-    for epoch in range(epochs):
+    
+    # Training loop with fixed total iterations
+    for iteration in range(total_iterations):
         model.train()
-        for batch_idx, (x, y) in enumerate(train_loader):
-            x, y = x.to(device), y.to(device)
-
-            # remap targets（仅在提供 class_map 时生效）
-            y = remap_targets(y, train_loader.dataset, device)
-
-            optimizer.zero_grad()
-
-            # 使用调试版本的 DP-SGD 训练
-            preclip_norm = dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm)
-
-            steps += 1
-            # 获取实际的 batch size
-            actual_batch_size = x.size(0)
-            eps = compute_epsilon_opacus(
-                noise_multiplier,
-                actual_batch_size / len(train_loader.dataset),
-                steps,
-                delta,
-            )
-
-            if batch_idx % 50 == 0:
-                # 重新计算 loss 用于显示
-                with torch.no_grad():
-                    output = model(x)
-                    if isinstance(output, tuple):
-                        logits = output[0]
-                    else:
-                        logits = output
-                    loss_val = F.cross_entropy(logits, y).item()
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss {loss_val:.4f}, "
-                      f"GradNorm {preclip_norm:.2f}, ε={eps:.3f}, δ={delta:.1e}")
-
-        # Epoch end: accuracy
-        train_acc = compute_accuracy(model, train_loader, device)
-        test_acc = compute_accuracy(model, test_loader, device)
-        print(f"Epoch {epoch}: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, "
-              f"Privacy ε={eps:.3f}, δ={delta:.1e}")
-
+        
+        # Get next batch
+        try:
+            batch_iter = iter(new_train_loader)
+            x, y = next(batch_iter)
+        except StopIteration:
+            # Reset iterator if we run out of data
+            batch_iter = iter(new_train_loader)
+            x, y = next(batch_iter)
+        
+        x, y = x.to(device), y.to(device)
+        
+        # Remap targets
+        y = remap_targets(y, train_loader.dataset, device)
+        
+        optimizer.zero_grad()
+        
+        # DP-SGD step
+        preclip_norm = dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm)
+        
+        steps += 1
+        
+        # Compute privacy spent
+        eps = compute_epsilon_opacus(
+            noise_multiplier,
+            sampling_rate,
+            steps,
+            delta,
+        )
+        
+        if iteration % 50 == 0:
+            # Compute loss for logging
+            with torch.no_grad():
+                output = model(x)
+                if isinstance(output, tuple):
+                    logits = output[0]
+                else:
+                    logits = output
+                loss_val = F.cross_entropy(logits, y).item()
+            print(f"Iteration {iteration}, Loss {loss_val:.4f}, "
+                  f"GradNorm {preclip_norm:.2f}, ε={eps:.3f}, δ={delta:.1e}")
+    
+    # Final evaluation
+    train_acc = compute_accuracy(model, train_loader, device)
+    test_acc = compute_accuracy(model, test_loader, device)
+    print(f"Final: Train Acc {train_acc:.4f}, Test Acc {test_acc:.4f}, "
+          f"Privacy ε={eps:.3f}, δ={delta:.1e}")
+    
     return train_acc, eps, delta
 
 
@@ -97,33 +138,32 @@ def train_dp(model, train_loader, test_loader, epochs, lr,
 # Main
 # ------------------------------
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="DP-SGD Training with Fixed Sampling Rate")
     parser.add_argument("--data_dir", type=str, default="./data")
-    parser.add_argument("--output_dir", type=str, default="./results_all")
-    parser.add_argument("--batch_size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=0.01)
-    parser.add_argument("--epochs_4class", type=int, default=50)
-    parser.add_argument("--epochs_6class", type=int, default=50)
-    parser.add_argument("--epochs_10class", type=int, default=50)
-    parser.add_argument("--epochs_fusion", type=int, default=30)
-    parser.add_argument("--noise_multiplier", type=float, default=1.1)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--delta", type=float, default=1e-5)
-    parser.add_argument("--epsilon", type=float, default=None,  # ✅ 新增参数
-                        help="Target ε for automatic noise multiplier computation")
-    parser.add_argument("--train_all", action="store_true")
-    parser.add_argument("--train_4class", action="store_true")
-    parser.add_argument("--train_6class", action="store_true")
-    parser.add_argument("--train_10class", action="store_true")
-    parser.add_argument("--train_fusion", action="store_true")
+    parser.add_argument("--output_dir", type=str, default="./results_dp")
+    parser.add_argument("--sampling_rate", type=float, default=0.05, help="Sampling rate q (default: 0.05)")
+    parser.add_argument("--lr", type=float, default=0.01, help="Learning rate")
+    parser.add_argument("--T1", type=int, default=1000, help="Iterations for 4-class and 6-class models (T_1 = T_2)")
+    parser.add_argument("--T3", type=int, default=1000, help="Iterations for 10-class model")
+    parser.add_argument("--noise_multiplier", type=float, default=None, help="Noise multiplier σ (auto-computed if not provided)")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0, help="Clipping constant C")
+    parser.add_argument("--delta", type=float, default=1e-5, help="Privacy parameter δ")
+    parser.add_argument("--epsilon", type=float, default=8.0, help="Target privacy budget ε")
+    parser.add_argument("--train_all", action="store_true", help="Train all models")
+    parser.add_argument("--train_4class", action="store_true", help="Train 4-class model")
+    parser.add_argument("--train_6class", action="store_true", help="Train 6-class model")
+    parser.add_argument("--train_10class", action="store_true", help="Train 10-class model")
+    parser.add_argument("--train_fusion", action="store_true", help="Train fusion model")
     args = parser.parse_args()
 
-    # ✅ 如果用户传入 epsilon，就自动计算 noise_multiplier
-    if args.epsilon is not None:
-        q = args.batch_size / 50000.0  # CIFAR-10 默认训练样本数
+    # Calculate total iterations and noise multiplier
+    total_iterations = args.T1 + args.T3  # T_1 + T_3
+    
+    if args.noise_multiplier is None:
+        # Auto-compute noise multiplier based on (epsilon, delta, total_iterations, sampling_rate)
         args.noise_multiplier = get_std(
-            q=q,
-            EPOCH=args.epochs_4class,
+            q=args.sampling_rate,
+            total_iterations=total_iterations,
             epsilon=args.epsilon,
             delta=args.delta,
             verbose=True
@@ -133,39 +173,55 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print("============================================================")
-    print("PER-SAMPLE DP-SGD TRAINING (hierarchical vs baseline)")
+    print("DP-SGD TRAINING WITH FIXED SAMPLING RATE")
     print("============================================================")
     print(f"Device: {device}")
-    print(f"DP params: sigma={args.noise_multiplier}, C={args.max_grad_norm}, delta={args.delta}")
-    print(f"LR={args.lr}, batch_size={args.batch_size}")
+    print(f"Sampling rate: {args.sampling_rate}")
+    print(f"T_1 (4-class, 6-class): {args.T1} iterations")
+    print(f"T_3 (10-class): {args.T3} iterations")
+    print(f"Total iterations: {total_iterations}")
+    print(f"DP params: σ={args.noise_multiplier:.4f}, C={args.max_grad_norm}, δ={args.delta}")
+    print(f"Target ε: {args.epsilon}")
 
-    # Data
-    loaders = DataProcessor.create_data_loaders(args.data_dir, batch_size=args.batch_size)
+    # Data loaders (use any batch size for data loading, will be recalculated based on sampling rate)
+    loaders = DataProcessor.create_data_loaders(args.data_dir, batch_size=256)
     m4_train, m4_test = loaders["vehicle_train"], loaders["vehicle_test"]
     m6_train, m6_test = loaders["animal_train"], loaders["animal_test"]
     m10_train, m10_test = loaders["full_train"], loaders["full_test"]
 
-    # ---------------- training ----------------
+    # Training 4-class model (T_1 iterations)
     if args.train_all or args.train_4class:
-        print("\nTraining 4class with DP-SGD...")
+        print(f"\n{'='*50}")
+        print("TRAINING 4-CLASS MODEL (T_1 iterations)")
+        print(f"{'='*50}")
         model4 = DP4Classifier()
-        train_dp(model4, m4_train, m4_test, args.epochs_4class, args.lr,
-                 args.noise_multiplier, args.max_grad_norm, args.delta, device)
+        train_dp(model4, m4_train, m4_test, args.T1, args.lr,
+                 args.noise_multiplier, args.max_grad_norm, args.delta, device, args.sampling_rate)
 
+    # Training 6-class model (T_2 = T_1 iterations)
     if args.train_all or args.train_6class:
-        print("\nTraining 6class with DP-SGD...")
+        print(f"\n{'='*50}")
+        print("TRAINING 6-CLASS MODEL (T_2 = T_1 iterations)")
+        print(f"{'='*50}")
         model6 = DP6Classifier()
-        train_dp(model6, m6_train, m6_test, args.epochs_6class, args.lr,
-                 args.noise_multiplier, args.max_grad_norm, args.delta, device)
+        train_dp(model6, m6_train, m6_test, args.T1, args.lr,
+                 args.noise_multiplier, args.max_grad_norm, args.delta, device, args.sampling_rate)
 
+    # Training 10-class model (T_3 iterations)
     if args.train_all or args.train_10class:
-        print("\nTraining 10class (baseline) with DP-SGD...")
+        print(f"\n{'='*50}")
+        print("TRAINING 10-CLASS MODEL (T_3 iterations)")
+        print(f"{'='*50}")
         model10 = DP10Classifier()
-        train_dp(model10, m10_train, m10_test, args.epochs_10class, args.lr,
-                 args.noise_multiplier, args.max_grad_norm, args.delta, device)
+        train_dp(model10, m10_train, m10_test, args.T3, args.lr,
+                 args.noise_multiplier, args.max_grad_norm, args.delta, device, args.sampling_rate)
 
+
+    # Training fusion model (non-DP)
     if args.train_all or args.train_fusion:
-        print("\nTraining Fusion model (4class + 6class embeddings)...")
+        print(f"\n{'='*50}")
+        print("TRAINING FUSION MODEL (Non-DP)")
+        print(f"{'='*50}")
         model4 = DP4Classifier().to(device)
         model6 = DP6Classifier().to(device)
         fusion = DPFusionModel()
@@ -175,13 +231,13 @@ def main():
         fusion.to(device)
         optimizer = optim.SGD(fusion.parameters(), lr=args.lr, momentum=0.9)
 
-        for epoch in range(args.epochs_fusion):
+        # Simple fusion training (non-DP)
+        for epoch in range(30):  # Fixed epochs for fusion
             fusion.train()
             for (x4, y4), (x6, y6) in zip(m4_train, m6_train):
                 x4, y4 = x4.to(device), y4.to(device)
                 x6, y6 = x6.to(device), y6.to(device)
 
-                # 只有在提供 class_map 时才 remap
                 y4 = remap_targets(y4, m4_train.dataset, device)
                 y6 = remap_targets(y6, m6_train.dataset, device)
 
@@ -195,9 +251,10 @@ def main():
                 loss.backward()
                 optimizer.step()
 
-            print(f"Epoch {epoch}: Fusion Loss {loss.item():.4f}")
+            if epoch % 10 == 0:
+                print(f"Fusion Epoch {epoch}: Loss {loss.item():.4f}")
 
-        print("Fusion training done.")
+        print("Fusion training completed.")
 
 
 if __name__ == "__main__":

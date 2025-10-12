@@ -215,13 +215,13 @@ def dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm):
 # Auto-compute noise multiplier σ (from Xiang et al., ICLR 2023)
 # ============================================================
 
-def get_std(q, EPOCH, epsilon, delta=1e-5, verbose=False):
+def get_std(q, total_iterations, epsilon, delta=1e-5, verbose=False):
     """
     Compute Gaussian noise std (σ, i.e., noise_multiplier) given:
-    - q:       sampling ratio = batch_size / dataset_size
-    - EPOCH:   total number of epochs
-    - epsilon: target privacy budget
-    - delta:   target δ (default = 1e-5)
+    - q:               sampling ratio (e.g., 0.05)
+    - total_iterations: total number of DP-SGD iterations (T_1 + T_3)
+    - epsilon:         target privacy budget
+    - delta:           target δ (default = 1e-5)
 
     Implementation based on:
     "A Theory to Instruct Differentially Private Learning via Clipping Bias Reduction"
@@ -230,10 +230,9 @@ def get_std(q, EPOCH, epsilon, delta=1e-5, verbose=False):
     import math
 
     def compute_eps(sigma):
-        # approximate Renyi DP-based epsilon computation
-        steps = int(EPOCH / q)
+        # Renyi DP-based epsilon computation
         alpha = 10.0
-        rdp = steps * (q ** 2) * alpha / (2 * sigma ** 2)
+        rdp = total_iterations * (q ** 2) * alpha / (2 * sigma ** 2)
         eps = rdp + math.log(1 / delta) / (alpha - 1)
         return eps
 
@@ -249,6 +248,6 @@ def get_std(q, EPOCH, epsilon, delta=1e-5, verbose=False):
 
     sigma = high
     if verbose:
-        print(f"[get_std] ε={epsilon}, δ={delta}, q={q:.6f}, EPOCH={EPOCH} → σ={sigma:.4f}")
+        print(f"[get_std] ε={epsilon}, δ={delta}, q={q:.6f}, total_iterations={total_iterations} → σ={sigma:.4f}")
     return sigma
 
