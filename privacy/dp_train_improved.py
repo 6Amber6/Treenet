@@ -120,11 +120,8 @@ class HierarchicalLoss(nn.Module):
         aux_4_loss = F.cross_entropy(aux_4_logits, aux_4_targets)
         aux_6_loss = F.cross_entropy(aux_6_logits, aux_6_targets)
         
-        # Consistency loss (encourage similar predictions)
-        consistency_loss = F.mse_loss(
-            F.softmax(aux_4_logits, dim=1), 
-            F.softmax(aux_6_logits, dim=1)
-        )
+        # Skip consistency loss for now (dimension mismatch issue)
+        consistency_loss = torch.tensor(0.0, device=main_logits.device)
         
         total_loss = (self.gamma * main_loss + 
                      self.alpha * (aux_4_loss + aux_6_loss) + 
