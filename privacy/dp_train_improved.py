@@ -193,7 +193,14 @@ def train_hierarchical_dp(model_4, model_6, fusion_model, train_loader, test_loa
             # Apply DP-SGD to each model
             dp_step_images(model_4, optimizer_4, x, aux_4_targets, sigma, C)
             dp_step_images(model_6, optimizer_6, x, aux_6_targets, sigma, C)
-            dp_step_images(fusion_model, optimizer_fusion, x, y, sigma, C)
+            
+            # Train fusion model with standard SGD (no DP for fusion)
+            fusion_model.train()
+            optimizer_fusion.zero_grad()
+            fusion_logits = fusion_model(emb_4.detach(), emb_6.detach())
+            fusion_loss = F.cross_entropy(fusion_logits, y)
+            fusion_loss.backward()
+            optimizer_fusion.step()
             
         if step % 10 == 0:
             # Evaluate on test set
