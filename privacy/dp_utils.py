@@ -251,182 +251,223 @@
 #         print(f"[get_std] ε={epsilon}, δ={delta}, q={q:.6f}, total_iterations={total_iterations} → σ={sigma:.4f}")
 #     return sigma
 
+
+# dp_utils.py
+# -*- coding: utf-8 -*-
 """
-DP-SGD utilities (sampling-rate only version)
-Implements per-sample gradient DP-SGD, CIFAR data handling, and noise calibration.
+Utilities for DP-SGD training:
+- Per-sample gradients using functorch (torch.func), clipping, Gaussian noise
+- Expected-batch-size normalization to match privacy accountant
+- Accuracy helpers
+- Dataset filters & label remapping for 4/6/10 classification
+- A simple sigma estimator to match (epsilon, delta, q, total_steps)
 """
 
+from typing import Dict, Tuple, List, Optional
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import math
-from typing import List, Dict
-
-
-# ============================================================
-# Noise multiplier calculator (from teacher’s paper)
-# ============================================================
-def get_std(q, EPOCH, epsilon, delta=1e-5, verbose=False):
-    """
-    Compute Gaussian noise std (σ) given:
-    q: sampling ratio
-    EPOCH: total iterations (T1+T3)
-    epsilon: privacy budget
-    delta: fixed 1e-5
-    Based on ICLR 2023 paper.
-    """
-    def compute_eps(sigma):
-        steps = int(EPOCH / q)
-        alpha = 10.0
-        rdp = steps * (q ** 2) * alpha / (2 * sigma ** 2)
-        eps = rdp + math.log(1 / delta) / (alpha - 1)
-        return eps
-
-    low, high = 0.01, 50.0
-    for _ in range(50):
-        mid = (low + high) / 2
-        eps = compute_eps(mid)
-        if eps > epsilon:
-            low = mid
-        else:
-            high = mid
-    sigma = high
-    if verbose:
-        print(f"[get_std] ε={epsilon}, δ={delta}, q={q:.6f}, EPOCH={EPOCH} → σ={sigma:.4f}")
-    return sigma
-
-
-# ============================================================
-# CIFAR-10 Data Utilities
-# ============================================================
-class FilteredDataset(torch.utils.data.Dataset):
-    """Subset of CIFAR-10 for filtered class groups."""
-    def __init__(self, dataset, indices, new_targets):
-        self.dataset = dataset
-        self.indices = indices
-        self.targets = torch.tensor(new_targets)
-    def __len__(self): return len(self.indices)
-    def __getitem__(self, idx):
-        x, _ = self.dataset[self.indices[idx]]
-        return x, self.targets[idx]
-
-
-class DataProcessor:
-    """Handle CIFAR10 splitting by class groups."""
-    @staticmethod
-    def get_cifar10_classes() -> Dict[str, List[int]]:
-        return {
-            "animal_classes": [2, 3, 4, 5, 6, 7],
-            "vehicle_classes": [0, 1, 8, 9],
-            "all_classes": list(range(10)),
-        }
-
-    @staticmethod
-    def filter_dataset(dataset, target_classes: List[int]):
-        mapping = {cls: i for i, cls in enumerate(target_classes)}
-        idxs, new_targets = [], []
-        for idx, (_, label) in enumerate(dataset):
-            if label in target_classes:
-                idxs.append(idx)
-                new_targets.append(mapping[label])
-        return FilteredDataset(dataset, idxs, new_targets)
-
-    @staticmethod
-    def create_data_loaders(data_dir: str, sampling_rate: float = 0.05, num_workers: int = 4):
-        import torchvision
-        import torchvision.transforms as transforms
-
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2023, 0.1994, 0.2010)),
-        ])
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.4914, 0.4822, 0.4465),
-                                 (0.2023, 0.1994, 0.2010)),
-        ])
-
-        train_dataset = torchvision.datasets.CIFAR10(root=data_dir, train=True, download=True, transform=transform_train)
-        test_dataset = torchvision.datasets.CIFAR10(root=data_dir, train=False, download=True, transform=transform_test)
-
-        total_size = len(train_dataset)
-        batch_size = max(1, int(total_size * sampling_rate))  # derived from q
-        print(f"[create_data_loaders] total={total_size}, sampling_rate={sampling_rate}, batch_size={batch_size}")
-
-        mappings = DataProcessor.get_cifar10_classes()
-        animal_train = DataProcessor.filter_dataset(train_dataset, mappings["animal_classes"])
-        animal_test = DataProcessor.filter_dataset(test_dataset, mappings["animal_classes"])
-        vehicle_train = DataProcessor.filter_dataset(train_dataset, mappings["vehicle_classes"])
-        vehicle_test = DataProcessor.filter_dataset(test_dataset, mappings["vehicle_classes"])
-
-        loaders = {
-            "animal_train": torch.utils.data.DataLoader(animal_train, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-            "animal_test": torch.utils.data.DataLoader(animal_test, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-            "vehicle_train": torch.utils.data.DataLoader(vehicle_train, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-            "vehicle_test": torch.utils.data.DataLoader(vehicle_test, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-            "full_train": torch.utils.data.DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers),
-            "full_test": torch.utils.data.DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers),
-        }
-        return loaders
-
-
-# ============================================================
-# Accuracy Computation
-# ============================================================
-def compute_accuracy(model, data_loader, device):
-    model.eval()
-    correct, total = 0, 0
-    with torch.no_grad():
-        for x, y in data_loader:
-            x, y = x.to(device), y.to(device)
-            out = model(x)
-            if isinstance(out, tuple): out = out[0]
-            pred = out.argmax(dim=1)
-            correct += pred.eq(y).sum().item()
-            total += y.size(0)
-    return correct / total
-
-
-# ============================================================
-# DP-SGD Step
-# ============================================================
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
 from torch.func import vmap, grad, functional_call
 
-def dp_step_images(model, optimizer, x, y, noise_multiplier, max_grad_norm):
-    """Pure PyTorch DP-SGD step with per-sample gradients."""
-    model.train()
-    optimizer.zero_grad()
+# --------------------
+# Privacy / DP core
+# --------------------
 
-    def compute_loss(params, buffers, xi, yi):
-        logits = functional_call(model, (params, buffers), (xi.unsqueeze(0),))
-        logits = logits[0] if isinstance(logits, tuple) else logits
-        return F.cross_entropy(logits, yi.unsqueeze(0))
-
+@torch.no_grad()
+def _stack_param_buffers(model: nn.Module):
     params = {k: v for k, v in model.named_parameters() if v.requires_grad}
     buffers = {k: v for k, v in model.named_buffers()}
+    return params, buffers
 
-    grads = vmap(grad(compute_loss), in_dims=(None, None, 0, 0))(params, buffers, x, y)
+def dp_step_images(model: nn.Module,
+                   optimizer: torch.optim.Optimizer,
+                   x: torch.Tensor,
+                   y: torch.Tensor,
+                   sigma: float,
+                   max_grad_norm: float,
+                   expected_batchsize: int) -> None:
+    """
+    Perform exactly ONE DP-SGD step on a minibatch:
+    - Compute per-sample grads
+    - Clip at max_grad_norm (C)
+    - Add Gaussian noise with std C * sigma
+    - Normalize by EXPECTED batch size (q*n), *not* the realized len(x)
+    """
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
 
-    per_norms = torch.zeros(x.size(0), device=x.device)
-    for p in grads.values():
-        per_norms += p.view(p.shape[0], -1).pow(2).sum(1)
-    per_norms = per_norms.sqrt()
+    params, buffers = _stack_param_buffers(model)
 
-    scales = (max_grad_norm / (per_norms + 1e-12)).clamp(max=1.0)
-    for k, p in grads.items():
-        grads[k] = p * scales.view(-1, *([1] * (p.ndim - 1)))
+    def compute_loss(p, b, xi, yi):
+        logits = functional_call(model, (p, b), (xi.unsqueeze(0),))
+        if isinstance(logits, tuple):  # (logits, feat)
+            logits = logits[0]
+        return F.cross_entropy(logits, yi.unsqueeze(0))
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad: continue
-        grad_sum = grads[name].sum(0)
-        if noise_multiplier > 0:
-            noise = torch.randn_like(grad_sum) * noise_multiplier * max_grad_norm
-            grad_sum += noise
-        param.grad = grad_sum / x.size(0)
+    # per-sample grads
+    per_grads = vmap(grad(compute_loss), in_dims=(None, None, 0, 0))(params, buffers, x, y)
+
+    # clip
+    with torch.no_grad():
+        per_norms = None
+        for g in per_grads.values():
+            g2 = g.view(g.shape[0], -1).pow(2).sum(1)
+            per_norms = g2 if per_norms is None else (per_norms + g2)
+        per_norms = per_norms.sqrt().clamp_min(1e-12)
+        scales = (max_grad_norm / per_norms).clamp(max=1.0)
+
+    for name, g in per_grads.items():
+        per_grads[name] = g * scales.view(-1, *([1] * (g.ndim - 1)))
+
+    # aggregate, add noise, normalize by expected batch size
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        g_sum = per_grads[name].sum(0)
+        if sigma > 0:
+            g_sum = g_sum + max_grad_norm * sigma * torch.randn_like(g_sum)
+        p.grad = g_sum / float(expected_batchsize)
 
     optimizer.step()
-    return per_norms.mean().item()
+
+
+# --------------------
+# Accuracy
+# --------------------
+
+@torch.no_grad()
+def compute_accuracy(model: nn.Module, loader: DataLoader, device: torch.device) -> float:
+    model.eval()
+    correct = 0
+    total = 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        out = model(x)
+        logits = out[0] if isinstance(out, tuple) else out
+        pred = logits.argmax(dim=1)
+        correct += (pred == y).sum().item()
+        total += y.numel()
+    return correct / max(1, total)
+
+
+# --------------------
+# CIFAR-10 splits
+# --------------------
+
+# CIFAR-10 classes:
+# 0 airplane, 1 automobile, 2 bird, 3 cat, 4 deer, 5 dog, 6 frog, 7 horse, 8 ship, 9 truck
+VEHICLE_4 = [0, 1, 8, 9]    # airplane, automobile, ship, truck
+ANIMAL_6  = [2, 3, 4, 5, 6, 7]
+
+def _remap_targets(targets, kept_classes: List[int]) -> torch.Tensor:
+    mapping = {c: i for i, c in enumerate(kept_classes)}
+    return torch.tensor([mapping[int(t)] for t in targets], dtype=torch.long)
+
+def _subset_indices_by_classes(targets: List[int], kept: List[int]) -> List[int]:
+    kept_set = set(kept)
+    return [i for i, t in enumerate(targets) if int(t) in kept_set]
+
+
+def get_cifar10_datasets(data_dir: str = "./data"):
+    tf_train = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+    ])
+    tf_test = transforms.Compose([
+        transforms.ToTensor(),
+    ])
+
+    train = datasets.CIFAR10(root=data_dir, train=True, download=True, transform=tf_train)
+    test  = datasets.CIFAR10(root=data_dir, train=False, download=True, transform=tf_test)
+    return train, test
+
+
+def build_split_loaders(q: float,
+                        data_dir: str,
+                        batchsize_full: Optional[int],
+                        num_workers: int = 2,
+                        seed: int = 1) -> Dict[str, DataLoader]:
+    """
+    Build train/test loaders for:
+    - vehicle 4-class (with remapped labels 0..3)
+    - animal 6-class (remapped 0..5)
+    - full 10-class (0..9)
+
+    Batch sizes are computed as round(q * n_subset).
+    """
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    train, test = get_cifar10_datasets(data_dir)
+
+    # full
+    y_train = torch.tensor(train.targets)
+    y_test  = torch.tensor(test.targets)
+
+    # 4-class vehicles
+    idx4_tr = _subset_indices_by_classes(y_train, VEHICLE_4)
+    idx4_te = _subset_indices_by_classes(y_test,  VEHICLE_4)
+    train4 = Subset(train, idx4_tr)
+    test4  = Subset(test,  idx4_te)
+
+    # remap labels
+    train4_targets = _remap_targets(y_train[idx4_tr], VEHICLE_4)
+    test4_targets  = _remap_targets(y_test[idx4_te],  VEHICLE_4)
+    # monkey patch targets so default collate works
+    train4.dataset.targets = list(y_train.numpy())  # keep original for other splits
+    test4.dataset.targets  = list(y_test.numpy())
+
+    # 6-class animals
+    idx6_tr = _subset_indices_by_classes(y_train, ANIMAL_6)
+    idx6_te = _subset_indices_by_classes(y_test,  ANIMAL_6)
+    train6 = Subset(train, idx6_tr)
+    test6  = Subset(test,  idx6_te)
+    train6_targets = _remap_targets(y_train[idx6_tr], ANIMAL_6)
+    test6_targets  = _remap_targets(y_test[idx6_te],  ANIMAL_6)
+
+    n4   = len(idx4_tr)
+    n6   = len(idx6_tr)
+    n10  = len(train)
+
+    b4  = max(1, round(q * n4))
+    b6  = max(1, round(q * n6))
+    b10 = max(1, round(q * n10))
+
+    # If user forces a batchsize_full (for reproducibility), respect it for 10-class
+    if batchsize_full is not None:
+        b10 = batchsize_full
+
+    loader = dict(
+        vehicle_train = DataLoader(train4, batch_size=b4, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
+        vehicle_test  = DataLoader(test4,  batch_size=256, shuffle=False, num_workers=num_workers),
+        animal_train  = DataLoader(train6, batch_size=b6, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
+        animal_test   = DataLoader(test6,  batch_size=256, shuffle=False, num_workers=num_workers),
+        full_train    = DataLoader(train,  batch_size=b10, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
+        full_test     = DataLoader(test,   batch_size=256, shuffle=False, num_workers=num_workers),
+        b4 = b4, b6 = b6, b10 = b10, n4 = n4, n6 = n6, n10 = n10
+    )
+    return loader
+
+
+# --------------------
+# Sigma estimator (simple closed-form upper bound)
+# --------------------
+
+def estimate_sigma(epsilon: float, delta: float, q: float, total_steps: int) -> float:
+    """
+    Very simple, conservative estimate:
+    epsilon ≈ q * sqrt(2 * total_steps * log(1/delta)) / sigma
+    => sigma ≈ q * sqrt(2 * total_steps * log(1/delta)) / epsilon
+
+    This matches order-of-magnitude used in many DP-SGD tutorials and is
+    reasonably close to typical accountants for small q.
+
+    If you have the teacher's accounting function, you can replace this with it.
+    """
+    total_steps = max(1, int(total_steps))
+    l = math.log(1.0 / max(1e-12, delta))
+    return (q * math.sqrt(2.0 * total_steps * l)) / max(1e-12, epsilon)
