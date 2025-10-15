@@ -1,251 +1,176 @@
 # """
-# ResNet-20 model implementation strictly following the paper 
-# "A Theory to Instruct Differentially Private Learning via Clipping Bias Reduction"
-# Uses GroupNorm instead of BatchNorm for DP-SGD compatibility
+# DP-SGD CNN models for CIFAR-10 with GroupNorm.
+# We provide:
+# - ResNet20GN backbone (no BatchNorm; use GroupNorm)
+# - Heads for 4-class, 6-class, 10-class
+# - A Fusion10 model that concatenates frozen (penultimate) features from
+#   the 4-class and 6-class models and trains a small DP head on top.
 # """
 
+# from typing import Tuple, Optional, List
 # import torch
 # import torch.nn as nn
 # import torch.nn.functional as F
-# from typing import Tuple
 
 
-# class BasicBlock(nn.Module):
-#     """
-#     BasicBlock implementation strictly following the paper
-#     Uses GroupNorm instead of BatchNorm, groups=8
-#     """
+# # --------------------
+# # ResNet-20 with GroupNorm
+# # --------------------
+
+# def conv3x3(in_planes, out_planes, stride=1):
+#     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+# class BasicBlockGN(nn.Module):
 #     expansion = 1
-
 #     def __init__(self, in_planes, planes, stride=1, groups=8):
-#         super(BasicBlock, self).__init__()
-#         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, 
-#                               padding=1, bias=False)
+#         super().__init__()
+#         self.conv1 = conv3x3(in_planes, planes, stride)
 #         self.gn1 = nn.GroupNorm(groups, planes)
-#         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, 
-#                               padding=1, bias=False)
+#         self.conv2 = conv3x3(planes, planes)
 #         self.gn2 = nn.GroupNorm(groups, planes)
 
 #         self.shortcut = nn.Sequential()
-#         if stride != 1 or in_planes != self.expansion * planes:
+#         if stride != 1 or in_planes != planes:
 #             self.shortcut = nn.Sequential(
-#                 nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, 
-#                          stride=stride, bias=False),
-#                 nn.GroupNorm(groups, self.expansion * planes)
+#                 nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
+#                 nn.GroupNorm(groups, planes),
 #             )
 
 #     def forward(self, x):
 #         out = F.relu(self.gn1(self.conv1(x)))
 #         out = self.gn2(self.conv2(out))
-#         out = out + self.shortcut(x)   
+#         out += self.shortcut(x)
 #         out = F.relu(out)
 #         return out
 
-
-# class ResNet20(nn.Module):
-#     """
-#     ResNet-20 implementation strictly following the paper
-#     Architecture: 3x3 conv -> 3 layers of 3 blocks each -> global avg pool -> fc
-#     """
-#     def __init__(self, num_classes=10, groups=8):
-#         super(ResNet20, self).__init__()
+# class ResNetGN(nn.Module):
+#     def __init__(self, block, num_blocks, num_classes=10, groups=8):
+#         super().__init__()
+#         self.in_planes = 16
 #         self.groups = groups
-        
-#         # Initial convolution layer
-#         self.conv1 = nn.Conv2d(3, 16, kernel_size=3, stride=1, padding=1, bias=False)
+
+#         self.conv1 = conv3x3(3, 16, 1)
 #         self.gn1 = nn.GroupNorm(groups, 16)
-        
-#         # ResNet layers: 3 blocks each layer
-#         self.layer1 = self._make_layer(16, 16, 3, stride=1)    # 3 blocks, 16->16
-#         self.layer2 = self._make_layer(16, 32, 3, stride=2)    # 3 blocks, 16->32, stride=2
-#         self.layer3 = self._make_layer(32, 64, 3, stride=2)    # 3 blocks, 32->64, stride=2
-        
-#         # Global average pooling and classifier
-#         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-#         self.fc = nn.Linear(64, num_classes)
-        
-#         # For embedding extraction
-#         self.embedding_dim = 64
-        
-#     def _make_layer(self, in_planes, planes, blocks, stride):
+#         self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
+#         self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
+#         self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+#         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
+#         self.feat_dim = 64 * block.expansion
+#         self.fc = nn.Linear(self.feat_dim, num_classes)
+
+#     def _make_layer(self, block, planes, num_blocks, stride):
+#         strides = [stride] + [1]*(num_blocks-1)
 #         layers = []
-#         layers.append(BasicBlock(in_planes, planes, stride, self.groups))
-#         for _ in range(1, blocks):
-#             layers.append(BasicBlock(planes, planes, 1, self.groups))
+#         for s in strides:
+#             layers.append(BasicBlockGN(self.in_planes, planes, s, groups=self.groups))
+#             self.in_planes = planes * block.expansion
 #         return nn.Sequential(*layers)
-    
-#     def forward(self, x):
-#         # Initial convolution
+
+#     def features(self, x):
 #         out = F.relu(self.gn1(self.conv1(x)))
-        
-#         # ResNet layers
 #         out = self.layer1(out)
 #         out = self.layer2(out)
 #         out = self.layer3(out)
-        
-#         # Global average pooling
 #         out = self.avgpool(out)
 #         out = out.view(out.size(0), -1)
-        
-#         # Classifier
-#         logits = self.fc(out)
-        
-#         return logits, out  # Return logits and embeddings
+#         return out
+
+#     def forward(self, x):
+#         f = self.features(x)
+#         logits = self.fc(f)
+#         return logits, f
 
 
-# class DPResNet20(ResNet20):
-#     """
-#     DP-SGD compatible ResNet-20
-#     Strictly following the paper implementation, using GroupNorm
-#     """
-#     def __init__(self, num_classes=10, groups=8):
-#         super().__init__(num_classes, groups)
-#         self.embedding_dim = 64
+# def ResNet20GN(num_classes=10, groups=8):
+#     return ResNetGN(BasicBlockGN, [3,3,3], num_classes=num_classes, groups=groups)
 
 
-# class DP4Classifier(DPResNet20):
-#     """4-class classifier - Vehicle classes"""
-#     def __init__(self, groups=8):
-#         super().__init__(num_classes=4, groups=groups)
+# # --------------------
+# # Heads / Wrapper Models
+# # --------------------
 
-
-# class DP6Classifier(DPResNet20):
-#     """6-class classifier - Animal classes"""
-#     def __init__(self, groups=8):
-#         super().__init__(num_classes=6, groups=groups)
-
-
-# class DP10Classifier(DPResNet20):
-#     """10-class classifier - Full CIFAR-10"""
-#     def __init__(self, groups=8):
-#         super().__init__(num_classes=10, groups=groups)
-
-
-# class DPFusionModel(nn.Module):
-#     """
-#     Fusion model implementation strictly following the paper requirements
-#     Combines embeddings from 4-class and 6-class models
-#     """
-#     def __init__(self, embedding_dim=64, num_classes=10, groups=8):
+# class Classifier4(nn.Module):
+#     """4-class vehicle classifier"""
+#     def __init__(self):
 #         super().__init__()
-#         self.embedding_dim = embedding_dim
-#         self.num_classes = num_classes
-        
-#         # Fusion layers using GroupNorm
-#         self.fusion_fc1 = nn.Linear(embedding_dim * 2, 128)
-#         self.gn1 = nn.GroupNorm(groups, 128)
-#         self.fusion_fc2 = nn.Linear(128, 64)
-#         self.gn2 = nn.GroupNorm(groups, 64)
-#         self.classifier = nn.Linear(64, num_classes)
-        
-#     def forward(self, embeddings_4class, embeddings_6class):
-#         """
-#         Fuse embeddings from two models
-#         Args:
-#             embeddings_4class: Embeddings from 4-class model
-#             embeddings_6class: Embeddings from 6-class model
-#         Returns:
-#             logits: Classification results
-#         """
-#         # Concatenate embeddings
-#         combined_embeddings = torch.cat([embeddings_4class, embeddings_6class], dim=1)
-        
-#         # Fusion layers
-#         x = F.relu(self.gn1(self.fusion_fc1(combined_embeddings)))
-#         x = F.relu(self.gn2(self.fusion_fc2(x)))
-#         logits = self.classifier(x)
-        
-#         return logits
+#         self.backbone = ResNet20GN(num_classes=4)
+
+#     def forward(self, x):
+#         return self.backbone(x)
 
 
-# def create_dp_model(model_type: str, num_classes: int, groups: int = 8) -> nn.Module:
+# class Classifier6(nn.Module):
+#     """6-class animal classifier"""
+#     def __init__(self):
+#         super().__init__()
+#         self.backbone = ResNet20GN(num_classes=6)
+
+#     def forward(self, x):
+#         return self.backbone(x)
+
+
+# class Classifier10(nn.Module):
+#     """10-class baseline classifier"""
+#     def __init__(self):
+#         super().__init__()
+#         self.backbone = ResNet20GN(num_classes=10)
+
+#     def forward(self, x):
+#         return self.backbone(x)
+
+
+# class Fusion10(nn.Module):
 #     """
-#     Create DP-SGD compatible model
-#     Strictly following the paper requirements
+#     Fusion model for 10 classes:
+#     - Take two trained models: 4-class and 6-class
+#     - Freeze their backbones
+#     - Concatenate their penultimate features
+#     - Train a small linear head with DP-SGD for 10 classes
 #     """
-#     if model_type == 'resnet20':
-#         return DPResNet20(num_classes=num_classes, groups=groups)
-#     elif model_type == '4class':
-#         return DP4Classifier(groups=groups)
-#     elif model_type == '6class':
-#         return DP6Classifier(groups=groups)
-#     elif model_type == '10class':
-#         return DP10Classifier(groups=groups)
-#     else:
-#         raise ValueError(f"Unknown model type: {model_type}")
+#     def __init__(self, model4: Classifier4, model6: Classifier6, hidden: int = 128):
+#         super().__init__()
+#         # freeze
+#         for p in model4.parameters():
+#             p.requires_grad = False
+#         for p in model6.parameters():
+#             p.requires_grad = False
 
+#         self.m4 = model4
+#         self.m6 = model6
+#         feat_dim4 = self.m4.backbone.feat_dim
+#         feat_dim6 = self.m6.backbone.feat_dim
+#         in_dim = feat_dim4 + feat_dim6
 
-# def count_parameters(model: nn.Module) -> int:
-#     """Count the number of trainable parameters in a model"""
-#     return sum(p.numel() for p in model.parameters() if p.requires_grad)
+#         # a light projection + classifier
+#         self.head = nn.Sequential(
+#             nn.Linear(in_dim, hidden),
+#             nn.ReLU(inplace=True),
+#             nn.Linear(hidden, 10),
+#         )
 
+#     def forward(self, x):
+#         _, f4 = self.m4.backbone(x)
+#         _, f6 = self.m6.backbone(x)
+#         f = torch.cat([f4, f6], dim=1)
+#         logits = self.head(f)
+#         return logits, f
 
-# if __name__ == "__main__":
-#     # Test models strictly following the paper implementation
-#     print("Testing paper-compliant DP-SGD models...")
-    
-#     # Test ResNet-20 architecture
-#     model = DPResNet20(num_classes=10, groups=8)
-#     print(f"ResNet-20 parameters: {count_parameters(model):,}")
-    
-#     # Test forward pass
-#     x = torch.randn(2, 3, 32, 32)
-#     logits, embeddings = model(x)
-#     print(f"Input shape: {x.shape}")
-#     print(f"Logits shape: {logits.shape}")
-#     print(f"Embeddings shape: {embeddings.shape}")
-    
-#     # Test classifiers
-#     model_4 = DP4Classifier()
-#     model_6 = DP6Classifier()
-#     model_10 = DP10Classifier()
-    
-#     logits_4, emb_4 = model_4(x)
-#     logits_6, emb_6 = model_6(x)
-#     logits_10, emb_10 = model_10(x)
-    
-#     print(f"\nClassifier outputs:")
-#     print(f"4-class: {logits_4.shape}, embedding: {emb_4.shape}")
-#     print(f"6-class: {logits_6.shape}, embedding: {emb_6.shape}")
-#     print(f"10-class: {logits_10.shape}, embedding: {emb_10.shape}")
-    
-#     # Test fusion model
-#     fusion_model = DPFusionModel()
-#     fusion_logits = fusion_model(emb_4, emb_6)
-#     print(f"Fusion output: {fusion_logits.shape}")
-    
-#     print("\n✅ All tests passed!")
-#     print("Models are strictly compliant with the paper requirements:")
-#     print("- ResNet-20 architecture")
-#     print("- GroupNorm with groups=8")
-#     print("- No BatchNorm layers")
-#     print("- Proper embedding extraction")
+#     def trainable_parameters(self):
+#         # only train the fusion head
+#         return self.head.parameters()
 
 
 
-# dp_models.py
+
+
+# dp_models.py (shared-backbone multi-head + fusion)
 # -*- coding: utf-8 -*-
-
-
-"""
-DP-SGD CNN models for CIFAR-10 with GroupNorm.
-We provide:
-- ResNet20GN backbone (no BatchNorm; use GroupNorm)
-- Heads for 4-class, 6-class, 10-class
-- A Fusion10 model that concatenates frozen (penultimate) features from
-  the 4-class and 6-class models and trains a small DP head on top.
-"""
-
-from typing import Tuple, Optional, List
+from typing import Tuple, Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-# --------------------
-# ResNet-20 with GroupNorm
-# --------------------
-
+# ---------- ResNet20 with GroupNorm (same as before) ----------
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
@@ -257,7 +182,6 @@ class BasicBlockGN(nn.Module):
         self.gn1 = nn.GroupNorm(groups, planes)
         self.conv2 = conv3x3(planes, planes)
         self.gn2 = nn.GroupNorm(groups, planes)
-
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != planes:
             self.shortcut = nn.Sequential(
@@ -272,118 +196,137 @@ class BasicBlockGN(nn.Module):
         out = F.relu(out)
         return out
 
-class ResNetGN(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10, groups=8):
+class ResNetGN_Features(nn.Module):
+    def __init__(self, groups=8):
         super().__init__()
         self.in_planes = 16
         self.groups = groups
-
         self.conv1 = conv3x3(3, 16, 1)
         self.gn1 = nn.GroupNorm(groups, 16)
-        self.layer1 = self._make_layer(block, 16, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 32, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 64, num_blocks[2], stride=2)
+        self.layer1 = self._make_layer(BasicBlockGN, 16, 3, stride=1)
+        self.layer2 = self._make_layer(BasicBlockGN, 32, 3, stride=2)
+        self.layer3 = self._make_layer(BasicBlockGN, 64, 3, stride=2)
         self.avgpool = nn.AdaptiveAvgPool2d((1,1))
-        self.feat_dim = 64 * block.expansion
-        self.fc = nn.Linear(self.feat_dim, num_classes)
+        self.feat_dim = 64
 
     def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for s in strides:
-            layers.append(BasicBlockGN(self.in_planes, planes, s, groups=self.groups))
+            layers.append(block(self.in_planes, planes, s, groups=self.groups))
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-    def features(self, x):
+    def forward(self, x):
         out = F.relu(self.gn1(self.conv1(x)))
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.avgpool(out)
-        out = out.view(out.size(0), -1)
-        return out
+        out = out.view(out.size(0), -1)  # [B, feat_dim]
+        return out  # features only
 
-    def forward(self, x):
-        f = self.features(x)
-        logits = self.fc(f)
-        return logits, f
-
-
-def ResNet20GN(num_classes=10, groups=8):
-    return ResNetGN(BasicBlockGN, [3,3,3], num_classes=num_classes, groups=groups)
-
-
-# --------------------
-# Heads / Wrapper Models
-# --------------------
-
-class Classifier4(nn.Module):
-    """4-class vehicle classifier"""
-    def __init__(self):
+# ---------- Heads ----------
+class LinearHead(nn.Module):
+    def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
-        self.backbone = ResNet20GN(num_classes=4)
+        self.fc = nn.Linear(in_dim, out_dim)
+    def forward(self, f):
+        return self.fc(f)
 
-    def forward(self, x):
-        return self.backbone(x)
-
-
-class Classifier6(nn.Module):
-    """6-class animal classifier"""
-    def __init__(self):
-        super().__init__()
-        self.backbone = ResNet20GN(num_classes=6)
-
-    def forward(self, x):
-        return self.backbone(x)
-
-
-class Classifier10(nn.Module):
-    """10-class baseline classifier"""
-    def __init__(self):
-        super().__init__()
-        self.backbone = ResNet20GN(num_classes=10)
-
-    def forward(self, x):
-        return self.backbone(x)
-
-
-class Fusion10(nn.Module):
+class FusionHead(nn.Module):
     """
-    Fusion model for 10 classes:
-    - Take two trained models: 4-class and 6-class
-    - Freeze their backbones
-    - Concatenate their penultimate features
-    - Train a small linear head with DP-SGD for 10 classes
+    Fusion head taking concatenation of:
+      - backbone features (feat_dim)
+      - logits_4 (4)
+      - logits_6 (6)
+    Then MLP -> 10 classes
     """
-    def __init__(self, model4: Classifier4, model6: Classifier6, hidden: int = 128):
+    def __init__(self, feat_dim: int, hidden: int = 256):
         super().__init__()
-        # freeze
-        for p in model4.parameters():
-            p.requires_grad = False
-        for p in model6.parameters():
-            p.requires_grad = False
-
-        self.m4 = model4
-        self.m6 = model6
-        feat_dim4 = self.m4.backbone.feat_dim
-        feat_dim6 = self.m6.backbone.feat_dim
-        in_dim = feat_dim4 + feat_dim6
-
-        # a light projection + classifier
-        self.head = nn.Sequential(
+        in_dim = feat_dim + 4 + 6
+        self.net = nn.Sequential(
             nn.Linear(in_dim, hidden),
+            nn.GroupNorm(8, hidden),
             nn.ReLU(inplace=True),
             nn.Linear(hidden, 10),
         )
+    def forward(self, fused):
+        return self.net(fused)
 
+# ---------- Multi-Head Model ----------
+class MultiHeadShared(nn.Module):
+    def __init__(self, groups=8, fusion_hidden=256):
+        super().__init__()
+        self.backbone = ResNetGN_Features(groups=groups)
+        d = self.backbone.feat_dim
+        self.head4 = LinearHead(d, 4)
+        self.head6 = LinearHead(d, 6)
+        self.fusion = FusionHead(d, hidden=fusion_hidden)
+
+    # forward helpers
+    def forward_4(self, x):
+        f = self.backbone(x)
+        logits4 = self.head4(f)
+        return logits4, f
+
+    def forward_6(self, x):
+        f = self.backbone(x)
+        logits6 = self.head6(f)
+        return logits6, f
+
+    def forward_fusion10(self, x):
+        # IMPORTANT: head4 & head6 used as frozen feature-to-logits adapters
+        with torch.no_grad():
+            f = self.backbone(x)  # backbone is frozen during fusion phase
+            logits4 = self.head4(f)
+            logits6 = self.head6(f)
+        fused = torch.cat([f, logits4, logits6], dim=1)
+        logits10 = self.fusion(fused)
+        return logits10, f
+
+    # utilities for training phases
+    def params_backbone_and_head4(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = True
+            yield p
+        for p in self.head4.parameters():
+            p.requires_grad = True
+            yield p
+        for p in self.head6.parameters():
+            p.requires_grad = False
+        for p in self.fusion.parameters():
+            p.requires_grad = False
+
+    def params_head6_only(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        for p in self.head4.parameters():
+            p.requires_grad = False
+        for p in self.head6.parameters():
+            p.requires_grad = True
+            yield p
+        for p in self.fusion.parameters():
+            p.requires_grad = False
+
+    def params_fusion_only(self):
+        for p in self.backbone.parameters():
+            p.requires_grad = False
+        for p in self.head4.parameters():
+            p.requires_grad = False
+        for p in self.head6.parameters():
+            p.requires_grad = False
+        for p in self.fusion.parameters():
+            p.requires_grad = True
+            yield p
+
+# ---------- A simple 10-class baseline model for comparison ----------
+class Baseline10(nn.Module):
+    def __init__(self, groups=8):
+        super().__init__()
+        self.backbone = ResNetGN_Features(groups=groups)
+        self.fc = nn.Linear(self.backbone.feat_dim, 10)
     def forward(self, x):
-        _, f4 = self.m4.backbone(x)
-        _, f6 = self.m6.backbone(x)
-        f = torch.cat([f4, f6], dim=1)
-        logits = self.head(f)
+        f = self.backbone(x)
+        logits = self.fc(f)
         return logits, f
-
-    def trainable_parameters(self):
-        # only train the fusion head
-        return self.head.parameters()
