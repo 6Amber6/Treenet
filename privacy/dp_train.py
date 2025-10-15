@@ -256,11 +256,12 @@ def main():
                 steps=args.T1, lr=args.lr, sigma=sigma, C=args.max_grad_norm,
                 device=device, expected_batchsize=b4, log_prefix="[DP/4-class]")
 
-    print("\n[Phase 2] Train head6 only (6-class)")
+    print("\n[Phase 2] Train head6 + partial backbone (6-class)")
     train_phase(model, phase="6",
-                loader=loaders["animal_train"], test_loader=loaders["animal_test"],
-                steps=args.T1, lr=args.lr, sigma=sigma, C=args.max_grad_norm,
-                device=device, expected_batchsize=b6, log_prefix="[DP/6-class]")
+            loader=loaders["animal_train"], test_loader=loaders["animal_test"],
+            steps=args.T1, lr=1.5, sigma=sigma, C=args.max_grad_norm,
+            device=device, expected_batchsize=b6, log_prefix="[DP/6-class]",
+            label_smoothing=0.05)
 
     print("\n[Phase 3] Train fusion head only (10-class)")
     train_phase(model, phase="fusion",

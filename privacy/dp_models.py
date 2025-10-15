@@ -162,13 +162,12 @@
 
 
 
-# dp_models.py (shared-backbone multi-head + fusion)
+# dp_models.py (Partial Unfreeze for Phase 2)
 # -*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ------------- ResNet20 + GroupNorm backbone (features only) -------------
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
@@ -222,9 +221,8 @@ class ResNetGN_Features(nn.Module):
         out = self.layer3(out)
         out = self.avgpool(out)
         out = out.view(out.size(0), -1)
-        return out  # features only
+        return out
 
-# ------------- Heads -------------
 class LinearHead(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -233,10 +231,6 @@ class LinearHead(nn.Module):
         return self.fc(f)
 
 class FusionHead(nn.Module):
-    """
-    Input: concat([backbone feature], [logits4], [logits6])
-    MLP -> 10 classes
-    """
     def __init__(self, feat_dim: int, hidden: int = 256):
         super().__init__()
         in_dim = feat_dim + 4 + 6
@@ -249,7 +243,6 @@ class FusionHead(nn.Module):
     def forward(self, fused):
         return self.net(fused)
 
-# ------------- Multi-Head Shared Model -------------
 class MultiHeadShared(nn.Module):
     def __init__(self, groups=8, fusion_hidden=256):
         super().__init__()
@@ -258,23 +251,34 @@ class MultiHeadShared(nn.Module):
         self.head4 = LinearHead(d, 4)
         self.head6 = LinearHead(d, 6)
         self.fusion = FusionHead(d, hidden=fusion_hidden)
-        self.current_phase = "4"  # "4", "6", "fusion"
+        self.current_phase = "4"
 
-    # switch training phase & requires_grad
     def set_phase(self, phase: str):
-        assert phase in ["4", "6", "fusion"]
         self.current_phase = phase
-        # reset grads flags
         for p in self.backbone.parameters():
-            p.requires_grad = (phase == "4")
+            p.requires_grad = False
         for p in self.head4.parameters():
-            p.requires_grad = (phase == "4")
+            p.requires_grad = False
         for p in self.head6.parameters():
-            p.requires_grad = (phase == "6")
+            p.requires_grad = False
         for p in self.fusion.parameters():
-            p.requires_grad = (phase == "fusion")
+            p.requires_grad = False
 
-    # forward routes
+        if phase == "4":
+            for p in self.backbone.parameters():
+                p.requires_grad = True
+            for p in self.head4.parameters():
+                p.requires_grad = True
+        elif phase == "6":
+            # ✅ 部分解冻 layer3（最后一层）
+            for p in self.backbone.layer3.parameters():
+                p.requires_grad = True
+            for p in self.head6.parameters():
+                p.requires_grad = True
+        elif phase == "fusion":
+            for p in self.fusion.parameters():
+                p.requires_grad = True
+
     def forward(self, x):
         if self.current_phase == "4":
             f = self.backbone(x)
@@ -282,7 +286,7 @@ class MultiHeadShared(nn.Module):
         elif self.current_phase == "6":
             f = self.backbone(x)
             return self.head6(f)
-        else:  # fusion
+        else:
             with torch.no_grad():
                 f = self.backbone(x)
                 logits4 = self.head4(f)
@@ -290,7 +294,6 @@ class MultiHeadShared(nn.Module):
             fused = torch.cat([f, logits4, logits6], dim=1)
             return self.fusion(fused)
 
-# ------------- Baseline 10-class -------------
 class Baseline10(nn.Module):
     def __init__(self, groups=8):
         super().__init__()
