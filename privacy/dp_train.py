@@ -164,7 +164,7 @@ def _cycle(loader: DataLoader):
         for batch in loader:
             yield batch
 
-def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, expected_batchsize, log_prefix, label_smoothing=0.0):
+def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, expected_batchsize, log_prefix):
     # 设置阶段 & 可训练参数
     model.set_phase(phase)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -176,7 +176,7 @@ def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, 
         x, y = next(it)
         x, y = x.to(device), y.to(device)
         # 直接用 model.forward（已按 phase 路由好）
-        dp_step_images(model, optimizer, x, y, sigma, C, expected_batchsize, label_smoothing=label_smoothing)
+        dp_step_images(model, optimizer, x, y, sigma, C, expected_batchsize)
 
         if step % 100 == 0:
             acc = compute_accuracy(model, test_loader, device)
@@ -260,8 +260,7 @@ def main():
     train_phase(model, phase="6",
             loader=loaders["animal_train"], test_loader=loaders["animal_test"],
             steps=args.T1, lr=1.5, sigma=sigma, C=args.max_grad_norm,
-            device=device, expected_batchsize=b6, log_prefix="[DP/6-class]",
-            label_smoothing=0.05)
+            device=device, expected_batchsize=b6, log_prefix="[DP/6-class]")
 
     print("\n[Phase 3] Train fusion head only (10-class)")
     train_phase(model, phase="fusion",
