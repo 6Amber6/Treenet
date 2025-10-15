@@ -150,170 +150,137 @@
 
 
 
-# dp_models.py (shared-backbone multi-head + fusion)
+# dp_train.py
 # -*- coding: utf-8 -*-
-from typing import Tuple, Iterable
+import argparse
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
-# ---------- ResNet20 with GroupNorm (same as before) ----------
-def conv3x3(in_planes, out_planes, stride=1):
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+from dp_models import MultiHeadShared, Baseline10
+from dp_utils import dp_step_images, compute_accuracy, build_split_loaders, estimate_sigma
 
-class BasicBlockGN(nn.Module):
-    expansion = 1
-    def __init__(self, in_planes, planes, stride=1, groups=8):
-        super().__init__()
-        self.conv1 = conv3x3(in_planes, planes, stride)
-        self.gn1 = nn.GroupNorm(groups, planes)
-        self.conv2 = conv3x3(planes, planes)
-        self.gn2 = nn.GroupNorm(groups, planes)
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
-                nn.GroupNorm(groups, planes),
-            )
+def _cycle(loader: DataLoader):
+    while True:
+        for batch in loader:
+            yield batch
 
-    def forward(self, x):
-        out = F.relu(self.gn1(self.conv1(x)))
-        out = self.gn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
+def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, expected_batchsize, log_prefix):
+    # 设置阶段 & 可训练参数
+    model.set_phase(phase)
+    params = [p for p in model.parameters() if p.requires_grad]
+    assert len(params) > 0, f"No trainable params in phase={phase}"
+    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9)
+    it = _cycle(loader)
 
-class ResNetGN_Features(nn.Module):
-    def __init__(self, groups=8):
-        super().__init__()
-        self.in_planes = 16
-        self.groups = groups
-        self.conv1 = conv3x3(3, 16, 1)
-        self.gn1 = nn.GroupNorm(groups, 16)
-        self.layer1 = self._make_layer(BasicBlockGN, 16, 3, stride=1)
-        self.layer2 = self._make_layer(BasicBlockGN, 32, 3, stride=2)
-        self.layer3 = self._make_layer(BasicBlockGN, 64, 3, stride=2)
-        self.avgpool = nn.AdaptiveAvgPool2d((1,1))
-        self.feat_dim = 64
+    for step in range(1, steps + 1):
+        x, y = next(it)
+        x, y = x.to(device), y.to(device)
+        # 直接用 model.forward（已按 phase 路由好）
+        dp_step_images(model, optimizer, x, y, sigma, C, expected_batchsize)
 
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for s in strides:
-            layers.append(block(self.in_planes, planes, s, groups=self.groups))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
+        if step % 100 == 0:
+            acc = compute_accuracy(model, test_loader, device)
+            print(f"{log_prefix} Step {step}/{steps} | Test Acc = {acc*100:.2f}%")
+    return model
 
-    def forward(self, x):
-        out = F.relu(self.gn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.avgpool(out)
-        out = out.view(out.size(0), -1)  # [B, feat_dim]
-        return out  # features only
+def train_baseline10(steps, lr, sigma, C, device, loaders):
+    model = Baseline10().to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9)
+    it = _cycle(loaders["full_train"])
+    for step in range(1, steps + 1):
+        x, y = next(it)
+        x, y = x.to(device), y.to(device)
+        dp_step_images(model, optimizer, x, y, sigma, C, loaders["b10"])
+        if step % 100 == 0:
+            acc = compute_accuracy(model, loaders["full_test"], device)
+            print(f"[DP] Step {step}/{steps} | Test Acc = {acc*100:.2f}%")
+    acc = compute_accuracy(model, loaders["full_test"], device)
+    print(f"[Baseline10] Final Test Acc = {acc*100:.2f}%")
+    return acc
 
-# ---------- Heads ----------
-class LinearHead(nn.Module):
-    def __init__(self, in_dim: int, out_dim: int):
-        super().__init__()
-        self.fc = nn.Linear(in_dim, out_dim)
-    def forward(self, f):
-        return self.fc(f)
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--sampling_rate", type=float, default=0.05)
+    parser.add_argument("--epsilon", type=float, default=6.0)
+    parser.add_argument("--delta", type=float, default=1e-5)
+    parser.add_argument("--T1", type=int, default=1000)
+    parser.add_argument("--T3", type=int, default=1000)
 
-class FusionHead(nn.Module):
-    """
-    Fusion head taking concatenation of:
-      - backbone features (feat_dim)
-      - logits_4 (4)
-      - logits_6 (6)
-    Then MLP -> 10 classes
-    """
-    def __init__(self, feat_dim: int, hidden: int = 256):
-        super().__init__()
-        in_dim = feat_dim + 4 + 6
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GroupNorm(8, hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden, 10),
-        )
-    def forward(self, fused):
-        return self.net(fused)
+    parser.add_argument("--data_dir", type=str, default="./data")
+    parser.add_argument("--lr", type=float, default=1.0)
+    parser.add_argument("--lr_fusion", type=float, default=0.5, help="LR for fusion head phase only")
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--batchsize_full", type=int, default=None)
+    parser.add_argument("--train_all", action="store_true", help="Run 4->6->Fusion10 pipeline")
+    parser.add_argument("--baseline_only", action="store_true")
+    args = parser.parse_args()
 
-# ---------- Multi-Head Model ----------
-class MultiHeadShared(nn.Module):
-    def __init__(self, groups=8, fusion_hidden=256):
-        super().__init__()
-        self.backbone = ResNetGN_Features(groups=groups)
-        d = self.backbone.feat_dim
-        self.head4 = LinearHead(d, 4)
-        self.head6 = LinearHead(d, 6)
-        self.fusion = FusionHead(d, hidden=fusion_hidden)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
 
-    # forward helpers
-    def forward_4(self, x):
-        f = self.backbone(x)
-        logits4 = self.head4(f)
-        return logits4, f
+    loaders = build_split_loaders(
+        q=args.sampling_rate,
+        data_dir=args.data_dir,
+        batchsize_full=args.batchsize_full,
+        num_workers=args.num_workers,
+        seed=args.seed
+    )
+    b4, b6, b10 = loaders["b4"], loaders["b6"], loaders["b10"]
+    n4, n6, n10 = loaders["n4"], loaders["n6"], loaders["n10"]
+    print(f"q={args.sampling_rate:.4f} | b4={b4}, b6={b6}, b10={b10} | n4={n4}, n6={n6}, n10={n10}")
 
-    def forward_6(self, x):
-        f = self.backbone(x)
-        logits6 = self.head6(f)
-        return logits6, f
+    sigma = estimate_sigma(
+        epsilon=args.epsilon,
+        delta=args.delta,
+        q=args.sampling_rate,
+        total_steps=args.T1 + args.T3
+    )
+    print(f"Computed sigma={sigma:.4f} for eps={args.epsilon}, delta={args.delta}, q={args.sampling_rate}, total_steps={args.T1 + args.T3}")
 
-    def forward_fusion10(self, x):
-        # IMPORTANT: head4 & head6 used as frozen feature-to-logits adapters
-        with torch.no_grad():
-            f = self.backbone(x)  # backbone is frozen during fusion phase
-            logits4 = self.head4(f)
-            logits6 = self.head6(f)
-        fused = torch.cat([f, logits4, logits6], dim=1)
-        logits10 = self.fusion(fused)
-        return logits10, f
+    if args.baseline_only:
+        train_baseline10(args.T3, args.lr, sigma, args.max_grad_norm, device, loaders)
+        return
 
-    # utilities for training phases
-    def params_backbone_and_head4(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = True
-            yield p
-        for p in self.head4.parameters():
-            p.requires_grad = True
-            yield p
-        for p in self.head6.parameters():
-            p.requires_grad = False
-        for p in self.fusion.parameters():
-            p.requires_grad = False
+    if not args.train_all:
+        print("Nothing to do: pass --train_all or --baseline_only")
+        return
 
-    def params_head6_only(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        for p in self.head4.parameters():
-            p.requires_grad = False
-        for p in self.head6.parameters():
-            p.requires_grad = True
-            yield p
-        for p in self.fusion.parameters():
-            p.requires_grad = False
+    # ---------- Multi-phase training ----------
+    model = MultiHeadShared().to(device)
 
-    def params_fusion_only(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        for p in self.head4.parameters():
-            p.requires_grad = False
-        for p in self.head6.parameters():
-            p.requires_grad = False
-        for p in self.fusion.parameters():
-            p.requires_grad = True
-            yield p
+    print("\n[Phase 1] Train backbone + head4 (4-class)")
+    train_phase(model, phase="4",
+                loader=loaders["vehicle_train"], test_loader=loaders["vehicle_test"],
+                steps=args.T1, lr=args.lr, sigma=sigma, C=args.max_grad_norm,
+                device=device, expected_batchsize=b4, log_prefix="[DP/4-class]")
 
-# ---------- A simple 10-class baseline model for comparison ----------
-class Baseline10(nn.Module):
-    def __init__(self, groups=8):
-        super().__init__()
-        self.backbone = ResNetGN_Features(groups=groups)
-        self.fc = nn.Linear(self.backbone.feat_dim, 10)
-    def forward(self, x):
-        f = self.backbone(x)
-        logits = self.fc(f)
-        return logits, f
+    print("\n[Phase 2] Train head6 only (6-class)")
+    train_phase(model, phase="6",
+                loader=loaders["animal_train"], test_loader=loaders["animal_test"],
+                steps=args.T1, lr=args.lr, sigma=sigma, C=args.max_grad_norm,
+                device=device, expected_batchsize=b6, log_prefix="[DP/6-class]")
+
+    print("\n[Phase 3] Train fusion head only (10-class)")
+    train_phase(model, phase="fusion",
+                loader=loaders["full_train"], test_loader=loaders["full_test"],
+                steps=args.T3, lr=args.lr_fusion, sigma=sigma, C=args.max_grad_norm,
+                device=device, expected_batchsize=b10, log_prefix="[DP/Fusion10]")
+
+    # Final eval on fusion
+    model.set_phase("fusion")
+    acc_fused = compute_accuracy(model, loaders["full_test"], device)
+    print(f"[Fusion10] Final Test Acc = {acc_fused*100:.2f}%")
+
+    print("\n[Baseline] Train independent 10-class DP-SGD for comparison")
+    acc_base = train_baseline10(args.T3, args.lr, sigma, args.max_grad_norm, device, loaders)
+
+    if acc_fused >= acc_base:
+        print("[Result] Fusion10 >= Baseline10 ✅")
+    else:
+        print("[Result] Fusion10 < Baseline10 ⚠️  Try: --lr_fusion 0.3 and/or --T3 1500; increase fusion hidden dim.")
+        print("        You can edit FusionHead(hidden=256→384/512) in dp_models.py")
+
+if __name__ == "__main__":
+    main()

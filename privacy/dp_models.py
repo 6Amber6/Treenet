@@ -162,15 +162,13 @@
 
 
 
-
 # dp_models.py (shared-backbone multi-head + fusion)
 # -*- coding: utf-8 -*-
-from typing import Tuple, Iterable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---------- ResNet20 with GroupNorm (same as before) ----------
+# ------------- ResNet20 + GroupNorm backbone (features only) -------------
 def conv3x3(in_planes, out_planes, stride=1):
     return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
@@ -223,10 +221,10 @@ class ResNetGN_Features(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.avgpool(out)
-        out = out.view(out.size(0), -1)  # [B, feat_dim]
+        out = out.view(out.size(0), -1)
         return out  # features only
 
-# ---------- Heads ----------
+# ------------- Heads -------------
 class LinearHead(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()
@@ -236,11 +234,8 @@ class LinearHead(nn.Module):
 
 class FusionHead(nn.Module):
     """
-    Fusion head taking concatenation of:
-      - backbone features (feat_dim)
-      - logits_4 (4)
-      - logits_6 (6)
-    Then MLP -> 10 classes
+    Input: concat([backbone feature], [logits4], [logits6])
+    MLP -> 10 classes
     """
     def __init__(self, feat_dim: int, hidden: int = 256):
         super().__init__()
@@ -254,7 +249,7 @@ class FusionHead(nn.Module):
     def forward(self, fused):
         return self.net(fused)
 
-# ---------- Multi-Head Model ----------
+# ------------- Multi-Head Shared Model -------------
 class MultiHeadShared(nn.Module):
     def __init__(self, groups=8, fusion_hidden=256):
         super().__init__()
@@ -263,64 +258,39 @@ class MultiHeadShared(nn.Module):
         self.head4 = LinearHead(d, 4)
         self.head6 = LinearHead(d, 6)
         self.fusion = FusionHead(d, hidden=fusion_hidden)
+        self.current_phase = "4"  # "4", "6", "fusion"
 
-    # forward helpers
-    def forward_4(self, x):
-        f = self.backbone(x)
-        logits4 = self.head4(f)
-        return logits4, f
-
-    def forward_6(self, x):
-        f = self.backbone(x)
-        logits6 = self.head6(f)
-        return logits6, f
-
-    def forward_fusion10(self, x):
-        # IMPORTANT: head4 & head6 used as frozen feature-to-logits adapters
-        with torch.no_grad():
-            f = self.backbone(x)  # backbone is frozen during fusion phase
-            logits4 = self.head4(f)
-            logits6 = self.head6(f)
-        fused = torch.cat([f, logits4, logits6], dim=1)
-        logits10 = self.fusion(fused)
-        return logits10, f
-
-    # utilities for training phases
-    def params_backbone_and_head4(self):
+    # switch training phase & requires_grad
+    def set_phase(self, phase: str):
+        assert phase in ["4", "6", "fusion"]
+        self.current_phase = phase
+        # reset grads flags
         for p in self.backbone.parameters():
-            p.requires_grad = True
-            yield p
+            p.requires_grad = (phase == "4")
         for p in self.head4.parameters():
-            p.requires_grad = True
-            yield p
+            p.requires_grad = (phase == "4")
         for p in self.head6.parameters():
-            p.requires_grad = False
+            p.requires_grad = (phase == "6")
         for p in self.fusion.parameters():
-            p.requires_grad = False
+            p.requires_grad = (phase == "fusion")
 
-    def params_head6_only(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        for p in self.head4.parameters():
-            p.requires_grad = False
-        for p in self.head6.parameters():
-            p.requires_grad = True
-            yield p
-        for p in self.fusion.parameters():
-            p.requires_grad = False
+    # forward routes
+    def forward(self, x):
+        if self.current_phase == "4":
+            f = self.backbone(x)
+            return self.head4(f)
+        elif self.current_phase == "6":
+            f = self.backbone(x)
+            return self.head6(f)
+        else:  # fusion
+            with torch.no_grad():
+                f = self.backbone(x)
+                logits4 = self.head4(f)
+                logits6 = self.head6(f)
+            fused = torch.cat([f, logits4, logits6], dim=1)
+            return self.fusion(fused)
 
-    def params_fusion_only(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = False
-        for p in self.head4.parameters():
-            p.requires_grad = False
-        for p in self.head6.parameters():
-            p.requires_grad = False
-        for p in self.fusion.parameters():
-            p.requires_grad = True
-            yield p
-
-# ---------- A simple 10-class baseline model for comparison ----------
+# ------------- Baseline 10-class -------------
 class Baseline10(nn.Module):
     def __init__(self, groups=8):
         super().__init__()
