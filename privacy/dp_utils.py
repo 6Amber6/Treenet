@@ -252,6 +252,7 @@
 #     return sigma
 
 
+
 # dp_utils.py
 # -*- coding: utf-8 -*-
 """
@@ -268,7 +269,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import datasets, transforms
 from torch.func import vmap, grad, functional_call
 
@@ -281,6 +282,7 @@ def _stack_param_buffers(model: nn.Module):
     params = {k: v for k, v in model.named_parameters() if v.requires_grad}
     buffers = {k: v for k, v in model.named_buffers()}
     return params, buffers
+
 
 def dp_step_images(model: nn.Module,
                    optimizer: torch.optim.Optimizer,
@@ -371,6 +373,20 @@ def _subset_indices_by_classes(targets: List[int], kept: List[int]) -> List[int]
     return [i for i, t in enumerate(targets) if int(t) in kept_set]
 
 
+class SubsetWithTargets(Dataset):
+    """A dataset wrapper that replaces labels with remapped ones."""
+    def __init__(self, dataset, indices, new_targets):
+        self.dataset = dataset
+        self.indices = indices
+        self.new_targets = new_targets
+    def __len__(self):
+        return len(self.indices)
+    def __getitem__(self, idx):
+        x, _ = self.dataset[self.indices[idx]]
+        y = self.new_targets[idx]
+        return x, y
+
+
 def get_cifar10_datasets(data_dir: str = "./data"):
     tf_train = transforms.Compose([
         transforms.RandomCrop(32, padding=4),
@@ -396,65 +412,63 @@ def build_split_loaders(q: float,
     - vehicle 4-class (with remapped labels 0..3)
     - animal 6-class (remapped 0..5)
     - full 10-class (0..9)
-
-    Batch sizes are computed as round(q * n_subset).
     """
     g = torch.Generator()
     g.manual_seed(seed)
 
     train, test = get_cifar10_datasets(data_dir)
 
-    # full
     y_train = torch.tensor(train.targets)
     y_test  = torch.tensor(test.targets)
 
     # 4-class vehicles
     idx4_tr = _subset_indices_by_classes(y_train, VEHICLE_4)
     idx4_te = _subset_indices_by_classes(y_test,  VEHICLE_4)
-    train4 = Subset(train, idx4_tr)
-    test4  = Subset(test,  idx4_te)
-
-    # remap labels
     train4_targets = _remap_targets(y_train[idx4_tr], VEHICLE_4)
     test4_targets  = _remap_targets(y_test[idx4_te],  VEHICLE_4)
-    # monkey patch targets so default collate works
-    train4.dataset.targets = list(y_train.numpy())  # keep original for other splits
-    test4.dataset.targets  = list(y_test.numpy())
+    train4 = SubsetWithTargets(train, idx4_tr, train4_targets)
+    test4  = SubsetWithTargets(test,  idx4_te,  test4_targets)
 
     # 6-class animals
     idx6_tr = _subset_indices_by_classes(y_train, ANIMAL_6)
     idx6_te = _subset_indices_by_classes(y_test,  ANIMAL_6)
-    train6 = Subset(train, idx6_tr)
-    test6  = Subset(test,  idx6_te)
     train6_targets = _remap_targets(y_train[idx6_tr], ANIMAL_6)
     test6_targets  = _remap_targets(y_test[idx6_te],  ANIMAL_6)
+    train6 = SubsetWithTargets(train, idx6_tr, train6_targets)
+    test6  = SubsetWithTargets(test,  idx6_te,  test6_targets)
+
+    # full 10-class
+    train10 = train
+    test10  = test
 
     n4   = len(idx4_tr)
     n6   = len(idx6_tr)
-    n10  = len(train)
+    n10  = len(train10)
 
     b4  = max(1, round(q * n4))
     b6  = max(1, round(q * n6))
     b10 = max(1, round(q * n10))
-
-    # If user forces a batchsize_full (for reproducibility), respect it for 10-class
     if batchsize_full is not None:
         b10 = batchsize_full
+
+    # Print sanity check for label mapping
+    print("4-class unique labels:", torch.unique(train4_targets))
+    print("6-class unique labels:", torch.unique(train6_targets))
 
     loader = dict(
         vehicle_train = DataLoader(train4, batch_size=b4, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
         vehicle_test  = DataLoader(test4,  batch_size=256, shuffle=False, num_workers=num_workers),
         animal_train  = DataLoader(train6, batch_size=b6, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
         animal_test   = DataLoader(test6,  batch_size=256, shuffle=False, num_workers=num_workers),
-        full_train    = DataLoader(train,  batch_size=b10, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
-        full_test     = DataLoader(test,   batch_size=256, shuffle=False, num_workers=num_workers),
+        full_train    = DataLoader(train10,  batch_size=b10, shuffle=True, num_workers=num_workers, generator=g, drop_last=True),
+        full_test     = DataLoader(test10,   batch_size=256, shuffle=False, num_workers=num_workers),
         b4 = b4, b6 = b6, b10 = b10, n4 = n4, n6 = n6, n10 = n10
     )
     return loader
 
 
 # --------------------
-# Sigma estimator (simple closed-form upper bound)
+# Sigma estimator
 # --------------------
 
 def estimate_sigma(epsilon: float, delta: float, q: float, total_steps: int) -> float:
@@ -462,12 +476,8 @@ def estimate_sigma(epsilon: float, delta: float, q: float, total_steps: int) -> 
     Very simple, conservative estimate:
     epsilon ≈ q * sqrt(2 * total_steps * log(1/delta)) / sigma
     => sigma ≈ q * sqrt(2 * total_steps * log(1/delta)) / epsilon
-
-    This matches order-of-magnitude used in many DP-SGD tutorials and is
-    reasonably close to typical accountants for small q.
-
-    If you have the teacher's accounting function, you can replace this with it.
     """
     total_steps = max(1, int(total_steps))
     l = math.log(1.0 / max(1e-12, delta))
     return (q * math.sqrt(2.0 * total_steps * l)) / max(1e-12, epsilon)
+
