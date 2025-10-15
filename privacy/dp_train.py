@@ -164,7 +164,7 @@ def _cycle(loader: DataLoader):
         for batch in loader:
             yield batch
 
-def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, expected_batchsize, log_prefix):
+def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, expected_batchsize, log_prefix, label_smoothing=0.0):
     # 设置阶段 & 可训练参数
     model.set_phase(phase)
     params = [p for p in model.parameters() if p.requires_grad]
@@ -176,7 +176,7 @@ def train_phase(model, phase, loader, test_loader, steps, lr, sigma, C, device, 
         x, y = next(it)
         x, y = x.to(device), y.to(device)
         # 直接用 model.forward（已按 phase 路由好）
-        dp_step_images(model, optimizer, x, y, sigma, C, expected_batchsize)
+        dp_step_images(model, optimizer, x, y, sigma, C, expected_batchsize, label_smoothing=label_smoothing)
 
         if step % 100 == 0:
             acc = compute_accuracy(model, test_loader, device)
