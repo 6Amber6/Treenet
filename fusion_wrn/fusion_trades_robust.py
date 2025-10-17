@@ -622,30 +622,29 @@ def eval_adv(model, loader, attack) -> float:
 
     acc = correct / max(tot, 1)
     return acc
-    
 
-def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema=None):
-    """
-    Standard cross-entropy training with optional EMA tracking.
-    🔹 New: also evaluates adversarial robustness (PGD) every 10 epochs.
-    """
+
+def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, args=None, ema=None):
+    """Standard CE training + optional adversarial eval"""
     opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
-                          weight_decay=5e-4, nesterov=True)
+                           weight_decay=getattr(args, "weight_decay", 5e-4), nesterov=True)
     sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[epochs // 2, int(epochs * 0.75)], gamma=0.1)
 
-    # ✅ Create PGD attack for adversarial eval
+    # ✅ PGD attack setup for evaluation
     from core.attacks import create_attack
     crit = nn.CrossEntropyLoss()
-    atk_eval = create_attack(model, crit,
-                             attack='linf-pgd',
-                             eps=8/255,
-                             nb_iter=10,
-                             eps_iter=2/255)
+    atk_eval = create_attack(
+        model,
+        crit,
+        getattr(args, "attack", "linf-pgd"),
+        getattr(args, "attack_eps", 8/255),
+        getattr(args, "attack_iter", 10),
+        getattr(args, "attack_step", 2/255),
+    )
 
     for ep in range(1, epochs + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
-
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(set_to_none=True)
@@ -661,21 +660,18 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema=None
 
         sch.step()
 
-        # ------------------- Evaluation -------------------
+        # ✅ Every 5 epochs, evaluate both Clean and Adversarial accuracy
         if ep % 5 == 0 or ep == 1:
             if ema:
                 ema.apply_to(model)
-
             clean_acc = eval_clean(model, test_loader)
-
-            # ✅ Evaluate adversarial robustness (PGD)
             adv_acc = eval_adv(model, test_loader, atk_eval)
-
             if ema:
                 ema.restore(model)
 
-            logger.log(f'{tag} Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} '
-                       f'| Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
+            logger.log(
+                f'{tag} Epoch {ep:03d} | Loss {total_loss/max(num_batches,1):.4f} | Clean {clean_acc:.4f} | Adv {adv_acc:.4f}'
+            )
 
 
 def train_fusion(model, train_loader, test_loader, args, logger):
@@ -779,10 +775,10 @@ def main():
     # ---------------- Train submodels ----------------
     logger.log(f'Training M1 (WRN-28-10, 4-class vehicles)')
     m1 = build_wrn_28_10(num_classes=len(vehicle_classes))
-    train_ce(m1, m1_train, m1_test, args.epochs_m, args.lr_m, logger, '[M1]')
+    train_ce(m1, m1_train, m1_test, args.epochs_m, args.lr_m, logger, '[M1]', args=args)
     logger.log(f'Training M2 (WRN-28-10, 6-class animals)')
     m2 = build_wrn_28_10(num_classes=len(animal_classes))
-    train_ce(m2, m2_train, m2_test, args.epochs_m, args.lr_m, logger, '[M2]')
+    train_ce(m2, m2_train, m2_test, args.epochs_m, args.lr_m, logger, '[M2]', args=args)
 
     a_acc = eval_clean(m1, m1_test)
     v_acc = eval_clean(m2, m2_test)
