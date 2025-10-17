@@ -773,12 +773,27 @@ def main():
                                                diff_fraction=args.diff_fraction)
 
     # ---------------- Train submodels ----------------
+ if not args.skip_submodels:
     logger.log(f'Training M1 (WRN-28-10, 4-class vehicles)')
     m1 = build_wrn_28_10(num_classes=len(vehicle_classes))
     train_ce(m1, m1_train, m1_test, args.epochs_m, args.lr_m, logger, '[M1]', args=args)
+    torch.save({'model_state_dict': m1.state_dict()}, os.path.join(LOG_DIR, 'M1_WRN.pt'))
+
     logger.log(f'Training M2 (WRN-28-10, 6-class animals)')
     m2 = build_wrn_28_10(num_classes=len(animal_classes))
     train_ce(m2, m2_train, m2_test, args.epochs_m, args.lr_m, logger, '[M2]', args=args)
+    torch.save({'model_state_dict': m2.state_dict()}, os.path.join(LOG_DIR, 'M2_WRN.pt'))
+
+else:
+    logger.log('🟢 Skipping submodel training, loading pretrained weights...')
+    m1_path = os.path.join(LOG_DIR.replace(args.desc, 'wrn28x10_diff70'), 'M1_WRN.pt')
+    m2_path = os.path.join(LOG_DIR.replace(args.desc, 'wrn28x10_diff70'), 'M2_WRN.pt')
+    m1 = build_wrn_28_10(num_classes=len(vehicle_classes))
+    m2 = build_wrn_28_10(num_classes=len(animal_classes))
+    m1.load_state_dict(torch.load(m1_path)['model_state_dict'])
+    m2.load_state_dict(torch.load(m2_path)['model_state_dict'])
+    logger.log('✅ Loaded M1_WRN.pt and M2_WRN.pt successfully.')
+
 
     a_acc = eval_clean(m1, m1_test)
     v_acc = eval_clean(m2, m2_test)
