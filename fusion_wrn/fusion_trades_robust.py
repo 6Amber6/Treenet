@@ -602,32 +602,81 @@ def make_eval_attack(model, args):
                          getattr(args, 'attack_iter', 20),
                          getattr(args, 'attack_step', 2/255))
 
-@torch.no_grad()
-def eval_adv(model, loader, attack):
-    model.eval(); tot, correct = 0, 0
+def eval_adv(model, loader, attack) -> float:
+    """
+    Evaluate model adversarial accuracy using a given attack (e.g. PGD).
+    Unlike eval_clean, this function must keep gradient computation ON
+    because the attack needs to call loss.backward().
+    """
+    model.eval()
+    tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        x_adv, _ = attack.perturb(x, y)
-        _, _, f_logits = model(x_adv)
-        correct += (f_logits.argmax(1) == y).sum().item(); tot += y.size(0)
-    return correct / max(tot, 1)
 
-# --------------------------- Training loops ---------------------------
-def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag):
-    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[epochs//2, int(epochs*0.75)], gamma=0.1)
-    for ep in range(1, epochs+1):
-        model.train(); total_loss, n = 0.0, 0
+        with torch.enable_grad():
+            x_adv, _ = attack.perturb(x, y)
+        with torch.no_grad():
+            _, _, f_logits = model(x_adv)
+            correct += (f_logits.argmax(1) == y).sum().item()
+            tot += y.size(0)
+
+    acc = correct / max(tot, 1)
+    return acc
+    
+
+def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema=None):
+    """
+    Standard cross-entropy training with optional EMA tracking.
+    🔹 New: also evaluates adversarial robustness (PGD) every 10 epochs.
+    """
+    opt = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9,
+                          weight_decay=5e-4, nesterov=True)
+    sch = torch.optim.lr_scheduler.MultiStepLR(opt, milestones=[epochs // 2, int(epochs * 0.75)], gamma=0.1)
+
+    # ✅ Create PGD attack for adversarial eval
+    from core.attacks import create_attack
+    crit = nn.CrossEntropyLoss()
+    atk_eval = create_attack(model, crit,
+                             attack='linf-pgd',
+                             eps=8/255,
+                             nb_iter=10,
+                             eps_iter=2/255)
+
+    for ep in range(1, epochs + 1):
+        model.train()
+        total_loss, num_batches = 0.0, 0
+
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(set_to_none=True)
-            loss = F.cross_entropy(model(x), y)
-            loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step(); total_loss += loss.item(); n += 1
+            logits = model(x)
+            loss = F.cross_entropy(logits, y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            opt.step()
+            if ema:
+                ema.update(model)
+            total_loss += loss.item()
+            num_batches += 1
+
         sch.step()
+
+        # ------------------- Evaluation -------------------
         if ep % 5 == 0 or ep == 1:
-            acc = eval_clean(model, test_loader)
-            logger.log(f'{tag} Epoch {ep:03d} | Train Loss {total_loss/max(n,1):.4f} | Test Acc {acc:.4f}')
+            if ema:
+                ema.apply_to(model)
+
+            clean_acc = eval_clean(model, test_loader)
+
+            # ✅ Evaluate adversarial robustness (PGD)
+            adv_acc = eval_adv(model, test_loader, atk_eval)
+
+            if ema:
+                ema.restore(model)
+
+            logger.log(f'{tag} Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} '
+                       f'| Clean Acc {clean_acc:.4f} | Adv Acc {adv_acc:.4f}')
+
 
 def train_fusion(model, train_loader, test_loader, args, logger):
     params = [{'params': model.head.parameters(), 'lr': args.lr},
