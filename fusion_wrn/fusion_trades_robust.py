@@ -671,33 +671,60 @@ def train_fusion(model, train_loader, test_loader, args, logger):
 
 # ------------------------------ Main -----------------------------------
 def main():
-    parse = parser_train()
-    parse.add_argument('--epochs-m', type=int, default=100)
-    parse.add_argument('--epochs-g', type=int, default=120)
-    parse.add_argument('--lr-m', type=float, default=0.1)
-    parse.add_argument('--aux_w', type=float, default=0.02)
-    parse.add_argument('--diff-fraction', type=float, default=0.7,
-                       help="fraction of diffusion data used for training (default 0.7)")
-    args = parse.parse_args()
+    parser = argparse.ArgumentParser(description="Fusion WRN TRADES + Diffusion Augmentation")
+    parser.add_argument('--data-dir', type=str, default='./data', help='dataset root directory')
+    parser.add_argument('--data', type=str, default='cifar10', help='dataset name')
+    parser.add_argument('--log-dir', type=str, default='./logs_diffusion', help='log directory')
+    parser.add_argument('--desc', type=str, required=True, help='description for experiment folder')
+    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--epochs-m', type=int, default=100)
+    parser.add_argument('--epochs-g', type=int, default=120)
+    parser.add_argument('--lr-m', type=float, default=0.1)
+    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--beta', type=float, default=8.0)
+    parser.add_argument('--aux_w', type=float, default=0.02)
+    parser.add_argument('--attack', type=str, default='linf-pgd')
+    parser.add_argument('--attack-eps', type=float, default=8/255)
+    parser.add_argument('--attack-step', type=float, default=2/255)
+    parser.add_argument('--attack-iter', type=int, default=12)
+    parser.add_argument('--weight-decay', type=float, default=5e-4)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--diff-fraction', type=float, default=0.7,
+                        help='fraction of diffusion data used for training (default 0.7)')
+    args = parser.parse_args()
 
     DATA_DIR = os.path.join(args.data_dir, args.data)
     DIFF_DIR = './data/edm_cifar10_1M'
     LOG_DIR = os.path.join(args.log_dir, args.desc)
-    if os.path.exists(LOG_DIR): shutil.rmtree(LOG_DIR)
+    if os.path.exists(LOG_DIR):
+        shutil.rmtree(LOG_DIR)
     os.makedirs(LOG_DIR, exist_ok=True)
+
     logger = Logger(os.path.join(LOG_DIR, 'log-train.log'))
-    with open(os.path.join(LOG_DIR, 'args.txt'), 'w') as f: json.dump(vars(args), f, indent=2)
+    with open(os.path.join(LOG_DIR, 'args.txt'), 'w') as f:
+        json.dump(vars(args), f, indent=2)
+
     logger.log(f'Using device: {DEVICE}')
-    seed(args.seed); torch.backends.cudnn.benchmark = True
+    seed(args.seed)
+    torch.backends.cudnn.benchmark = True
 
     # ---------------- Dataloaders ----------------
     _, full_train = _build_cifar10(DATA_DIR, True, 4, args.batch_size)
-    _, full_test  = _build_cifar10(DATA_DIR, False, 4, args.batch_size)
+    _, full_test = _build_cifar10(DATA_DIR, False, 4, args.batch_size)
+
     # model1 = 4-class vehicles, model2 = 6-class animals
-    m1_train = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, vehicle_classes, args.batch_size, train=True, diff_fraction=args.diff_fraction)
-    m1_test  = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, vehicle_classes, args.batch_size, train=False, diff_fraction=args.diff_fraction)
-    m2_train = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, animal_classes, args.batch_size, train=True, diff_fraction=args.diff_fraction)
-    m2_test  = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, animal_classes, args.batch_size, train=False, diff_fraction=args.diff_fraction)
+    m1_train = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, vehicle_classes,
+                                                args.batch_size, train=True,
+                                                diff_fraction=args.diff_fraction)
+    m1_test = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, vehicle_classes,
+                                               args.batch_size, train=False,
+                                               diff_fraction=args.diff_fraction)
+    m2_train = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, animal_classes,
+                                                args.batch_size, train=True,
+                                                diff_fraction=args.diff_fraction)
+    m2_test = build_diffusion_augmented_loader(DATA_DIR, DIFF_DIR, animal_classes,
+                                               args.batch_size, train=False,
+                                               diff_fraction=args.diff_fraction)
 
     # ---------------- Train submodels ----------------
     logger.log(f'Training M1 (WRN-28-10, 4-class vehicles)')
@@ -706,7 +733,9 @@ def main():
     logger.log(f'Training M2 (WRN-28-10, 6-class animals)')
     m2 = build_wrn_28_10(num_classes=len(animal_classes))
     train_ce(m2, m2_train, m2_test, args.epochs_m, args.lr_m, logger, '[M2]')
-    a_acc = eval_clean(m1, m1_test); v_acc = eval_clean(m2, m2_test)
+
+    a_acc = eval_clean(m1, m1_test)
+    v_acc = eval_clean(m2, m2_test)
     logger.log(f'[M1-4class] Clean Test Acc: {a_acc:.4f}')
     logger.log(f'[M2-6class] Clean Test Acc: {v_acc:.4f}')
 
@@ -714,15 +743,20 @@ def main():
     in_dim = int(m1.fc.in_features + m2.fc.in_features)
     head = WRNHead(in_dim, num_classes=10, p_drop=0.2).to(DEVICE)
     fusion = FusionWRN(m1, m2, head).to(DEVICE)
+
     logger.log('Starting fusion training (TRADES)...')
     train_fusion(fusion, full_train, full_test, args, logger)
+
     atk = make_eval_attack(fusion, args)
-    clean = eval_clean(fusion, full_test); adv = eval_adv(fusion, full_test, atk)
+    clean = eval_clean(fusion, full_test)
+    adv = eval_adv(fusion, full_test, atk)
     logger.log(f'[WRN-Fusion] Final Clean {clean:.4f} | Adv {adv:.4f}')
+
     torch.save({'model_state_dict': m1.state_dict()}, os.path.join(LOG_DIR, 'M1_WRN.pt'))
     torch.save({'model_state_dict': m2.state_dict()}, os.path.join(LOG_DIR, 'M2_WRN.pt'))
     torch.save({'model_state_dict': fusion.state_dict()}, os.path.join(LOG_DIR, 'Fusion_WRN.pt'))
     logger.log(f'Saved models to {LOG_DIR}')
+
 
 if __name__ == '__main__':
     main()
