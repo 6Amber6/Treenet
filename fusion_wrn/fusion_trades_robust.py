@@ -690,7 +690,13 @@ def eval_adv(model, loader, attack) -> float:
         with torch.enable_grad():
             x_adv, _ = attack.perturb(x, y)
         with torch.no_grad():
-            _, _, f_logits = model(x_adv)
+            model_output = model(x_adv)
+            if isinstance(model_output, tuple) and len(model_output) == 3:
+                # FusionWRN model returns (m1_logits, m2_logits, fusion_logits)
+                _, _, f_logits = model_output
+            else:
+                # Individual WRN model returns only logits
+                f_logits = model_output
             correct += (f_logits.argmax(1) == y).sum().item()
             tot += y.size(0)
 
