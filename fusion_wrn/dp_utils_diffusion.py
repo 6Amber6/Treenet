@@ -1,10 +1,11 @@
 import os
-from typing import List, Tuple
+from typing import List
 import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 import torchvision
 import torchvision.transforms as T
+from PIL import Image
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -116,6 +117,11 @@ class DiffusionNPZ(Dataset):
     def __getitem__(self, idx: int):
         img = self.images[idx]
         lab = int(self.labels[idx])
+
+        # ✅ ensure image is PIL before transforms
+        if isinstance(img, np.ndarray):
+            img = Image.fromarray(img)
+
         img = self.transform(img)
         return img, torch.tensor(lab, dtype=torch.long)
 
@@ -153,7 +159,7 @@ def build_diffusion_augmented_loader(
         idx = np.random.choice(diff_len, take, replace=False)
         ds_diff = Subset(ds_diff, idx)
     else:
-        # 测试集少取 diffusion
+        # 测试集只取较少 diffusion 样本
         take = min(6000, diff_len)
         idx = np.random.choice(diff_len, take, replace=False)
         ds_diff = Subset(ds_diff, idx)
