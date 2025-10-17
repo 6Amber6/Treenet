@@ -1,105 +1,147 @@
-# dp_utils_diffusion.py
-# Utility for loading CIFAR-10 + Diffusion-generated CIFAR data (e.g., EDM-1M)
-# Works with animal_classes (2–7) and vehicle_classes (0,1,8,9)
-
 import os
-from typing import List
+import numpy as np
 import torch
-from torch.utils.data import DataLoader, ConcatDataset, Subset
+from torch.utils.data import Dataset, DataLoader, ConcatDataset, Subset
 import torchvision
 import torchvision.transforms as T
+from typing import List, Tuple
 
-# CIFAR-10 normalization constants
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
 CIFAR10_STD  = (0.2023, 0.1994, 0.2010)
 
 
-# --------------------------- helper: base dataset ---------------------------
-def _build_cifar10(root: str, train: bool, batch_size: int, num_workers=4):
-    """Return standard CIFAR-10 DataLoader."""
-    tfm = T.Compose([
-        T.RandomCrop(32, padding=4) if train else T.Lambda(lambda x: x),
-        T.RandomHorizontalFlip() if train else T.Lambda(lambda x: x),
+# =====================================================
+# 1️⃣ Diffusion Dataset
+# =====================================================
+class DiffusionAugmentedDataset(Dataset):
+    def __init__(self, npz_path: str, transform=None):
+        if not os.path.exists(npz_path):
+            raise FileNotFoundError(f"[Error] Diffusion data file not found: {npz_path}")
+        data = np.load(npz_path)
+
+        # Auto-detect field names
+        keys = list(data.keys())
+        if "images" in keys and "labels" in keys:
+            imgs, labels = data["images"], data["labels"]
+        elif "image" in keys and "label" in keys:
+            imgs, labels = data["image"], data["label"]
+        elif "arr_0" in keys and "arr_1" in keys:
+            imgs, labels = data["arr_0"], data["arr_1"]
+        else:
+            raise KeyError(f"Unexpected keys in diffusion npz: {keys}")
+
+        self.images = imgs
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        img = self.images[idx]
+        label = self.labels[idx]
+
+        # Convert numpy to tensor
+        if isinstance(img, np.ndarray):
+            img = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+        if isinstance(label, (np.int64, int)):
+            label = torch.tensor(label, dtype=torch.long)
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        return img, label
+
+
+# =====================================================
+# 2️⃣ CIFAR-10 Loader with label filtering
+# =====================================================
+def _build_cifar10(data_dir: str, train: bool, num_workers=4, batch_size=128):
+    transform_train = T.Compose([
+        T.RandomCrop(32, padding=4),
+        T.RandomHorizontalFlip(),
         T.ToTensor(),
         T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
     ])
-    ds = torchvision.datasets.CIFAR10(root=root, train=train, download=True, transform=tfm)
-    loader = DataLoader(ds, batch_size=batch_size, shuffle=train, num_workers=num_workers,
-                        pin_memory=torch.cuda.is_available())
+    transform_test = T.Compose([
+        T.ToTensor(),
+        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
+    ])
+    ds = torchvision.datasets.CIFAR10(
+        root=data_dir,
+        train=train,
+        download=True,
+        transform=transform_train if train else transform_test
+    )
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=train, num_workers=num_workers, pin_memory=True)
     return ds, loader
 
 
-# --------------------------- helper: subset & remap ---------------------------
 def _filter_indices(ds: torchvision.datasets.CIFAR10, keep: List[int]):
-    """Return indices and label remapping dict for given subset."""
     idx = [i for i, (_, y) in enumerate(ds) if y in keep]
     remap = {old: new for new, old in enumerate(keep)}
     return idx, remap
 
 
-class RemappedSubset(torch.utils.data.Dataset):
+class RemappedSubset(Dataset):
     def __init__(self, base, indices, remap):
         self.base = base
         self.indices = indices
         self.remap = remap
-    def __len__(self): return len(self.indices)
+
+    def __len__(self):
+        return len(self.indices)
+
     def __getitem__(self, i):
         x, y = self.base[self.indices[i]]
         return x, self.remap[int(y)]
 
 
-# --------------------------- main: build combined dataset ---------------------------
+# =====================================================
+# 3️⃣ Build Diffusion-Augmented Loader
+# =====================================================
 def build_diffusion_augmented_loader(
-    real_root: str,
-    diff_root: str,
+    data_dir: str,
+    diff_dir: str,
     keep_labels: List[int],
     batch_size: int,
     train: bool,
-    num_workers=4
+    num_workers: int = 4,
 ):
-    """
-    Build DataLoader combining real CIFAR-10 and diffusion-generated .npz data (EDM-1M).
-    keep_labels: list of labels to keep (e.g., [0,1,8,9] for vehicles).
-    diff_root: directory containing 1M.npz file.
-    """
-    import numpy as np
-    from torch.utils.data import TensorDataset, ConcatDataset, DataLoader, Subset
+    """Combine real CIFAR subset and diffusion-generated images"""
 
-    # Transform
-    tfm = T.Compose([
-        T.RandomCrop(32, padding=4) if train else T.Lambda(lambda x: x),
-        T.RandomHorizontalFlip() if train else T.Lambda(lambda x: x),
-        T.ToTensor(),
-        T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-    ])
+    # --- Real CIFAR Subset ---
+    ds_real, _ = _build_cifar10(data_dir, train=train, num_workers=num_workers, batch_size=batch_size)
+    indices, remap = _filter_indices(ds_real, keep_labels)
+    sub_real = RemappedSubset(ds_real, indices, remap)
 
-    # 1️⃣ Load real CIFAR
-    real_ds = torchvision.datasets.CIFAR10(root=real_root, train=train, download=True, transform=tfm)
-    real_idx, real_remap = _filter_indices(real_ds, keep_labels)
-    real_sub = RemappedSubset(real_ds, real_idx, real_remap)
-
-    # 2️⃣ Load diffusion data (.npz)
-    npz_path = os.path.join(diff_root, "1M.npz")
+    # --- Diffusion Data ---
+    npz_path = os.path.join(diff_dir, "1M.npz")
     print(f"[Loading diffusion data from {npz_path}]")
-    data = np.load(npz_path)
-    imgs = data["images"] / 255.0  # scale to [0,1]
-    labels = data["labels"].astype(int)
+    diff_ds = DiffusionAugmentedDataset(npz_path)
 
-    # Convert to tensor
-    imgs = torch.tensor(imgs).permute(0, 3, 1, 2).float()
-    labels = torch.tensor(labels).long()
+    # --- Balance ratio ---
+    real_len = len(sub_real)
+    diff_len = len(diff_ds)
+    if train:
+        sample_ratio = min(20, diff_len // real_len)  # e.g., 600k : 30k
+        diff_indices = np.random.choice(diff_len, real_len * sample_ratio, replace=False)
+        diff_ds = Subset(diff_ds, diff_indices)
+    else:
+        diff_indices = np.random.choice(diff_len, min(6000, diff_len), replace=False)
+        diff_ds = Subset(diff_ds, diff_indices)
 
-    # Filter only the classes we want
-    mask = torch.isin(labels, torch.tensor(keep_labels))
-    imgs, labels = imgs[mask], labels[mask]
-    diff_subset = TensorDataset(imgs, labels)
+    merged = ConcatDataset([sub_real, diff_ds])
+    print(f"[Diffusion Loader] Real: {len(sub_real)} | Diffusion: {len(diff_ds)} | Total: {len(merged)}")
 
-    # 3️⃣ Combine both datasets
-    combined = ConcatDataset([real_sub, diff_subset])
+    # --- Safe collate_fn (to prevent 'int' error) ---
+    def safe_collate(batch):
+        imgs, labels = zip(*batch)
+        imgs = torch.stack([torch.as_tensor(i, dtype=torch.float32) for i in imgs])
+        labels = torch.tensor(labels, dtype=torch.long)
+        return imgs, labels
 
-    # 4️⃣ Build DataLoader
-    loader = DataLoader(combined, batch_size=batch_size, shuffle=train,
-                        num_workers=num_workers, pin_memory=torch.cuda.is_available())
-
-    print(f"[Diffusion Loader] Real: {len(real_sub)} | Diffusion: {len(diff_subset)} | Total: {len(combined)}")
+    loader = DataLoader(merged, batch_size=batch_size, shuffle=train, num_workers=num_workers, pin_memory=True, collate_fn=safe_collate)
     return loader
