@@ -1,5 +1,5 @@
 # fusion_trades_robust.py
-# CIFAR-10 WRN-28-10 fusion + TRADES, tuned for robust acc 0.40–0.55 (PGD-20, eps=8/255)
+# CIFAR-10 WRN-28-10 fusion + TRADES, tuned for robust acc 0.4542 (PGD-20, eps=8/255)
 
 import os
 import sys
