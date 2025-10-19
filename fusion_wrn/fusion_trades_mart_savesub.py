@@ -519,14 +519,10 @@ def main():
     parse.add_argument('--aux_w', type=float, default=0.02, help="weight for auxiliary CE loss")
     parse.add_argument('--ema-decay', type=float, default=0.9995, help="EMA decay for fusion model")
 
-    # stronger PGD defaults
-    parse.add_argument('--attack', type=str, default='linf-pgd')
-    parse.add_argument('--attack-eps', type=float, default=8/255)
-    parse.add_argument('--attack-step', type=float, default=0.01)
-    parse.add_argument('--attack-iter', type=int, default=20)
-
-    # TRADES / MART choices
-    parse.add_argument('--beta', type=float, default=8.0, help='TRADES beta (ignored if MART)')
+    # Override attack defaults for stronger PGD
+    parse.set_defaults(attack_step=0.01, attack_iter=20, attack_eps=8/255)
+    
+    # TRADES / MART choices (beta already defined in parser_train)
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
     
