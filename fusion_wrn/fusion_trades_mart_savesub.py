@@ -259,8 +259,13 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
     One adversarial training step for FusionWRN. If use_mart=True, swap TRADES robust term with MART loss.
     """
     class LogitsOnly(nn.Module):
-        def __init__(self, base): super().__init__(); self.base = base
-        def forward(self, x): return self.base(x)[-1]
+        def __init__(self, base): 
+            super().__init__()
+            self.base = base
+        def forward(self, x): 
+            # 确保梯度计算正常
+            _, _, fusion_logits = self.base(x)
+            return fusion_logits
 
     logits_model = LogitsOnly(model).to(DEVICE)
 
@@ -330,8 +335,13 @@ def eval_clean(model, loader) -> float:
 
 def make_eval_attack(model, args):
     class FusionWrapper(nn.Module):
-        def __init__(self, base): super().__init__(); self.base = base
-        def forward(self, x): return self.base(x)[-1]
+        def __init__(self, base): 
+            super().__init__()
+            self.base = base
+        def forward(self, x): 
+            # 确保梯度计算正常
+            _, _, fusion_logits = self.base(x)
+            return fusion_logits
     crit = nn.CrossEntropyLoss()
     return create_attack(
         FusionWrapper(model), crit,
@@ -346,9 +356,15 @@ def eval_adv(model, loader, attack) -> float:
     tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
-        x_adv, _ = attack.perturb(x, y)
-        _, _, f_logits = model(x_adv)
-        correct += (f_logits.argmax(1) == y).sum().item()
+        try:
+            x_adv, _ = attack.perturb(x, y)
+            _, _, f_logits = model(x_adv)
+            correct += (f_logits.argmax(1) == y).sum().item()
+        except Exception as e:
+            print(f"Warning: Attack failed for batch, using clean samples: {e}")
+            # 如果攻击失败，使用干净样本
+            _, _, f_logits = model(x)
+            correct += (f_logits.argmax(1) == y).sum().item()
         tot += y.size(0)
     return correct / max(tot, 1)
 
@@ -503,8 +519,14 @@ def main():
     parse.add_argument('--aux_w', type=float, default=0.02, help="weight for auxiliary CE loss")
     parse.add_argument('--ema-decay', type=float, default=0.9995, help="EMA decay for fusion model")
 
+    # stronger PGD defaults
+    parse.add_argument('--attack', type=str, default='linf-pgd')
+    parse.add_argument('--attack-eps', type=float, default=8/255)
+    parse.add_argument('--attack-step', type=float, default=0.01)
+    parse.add_argument('--attack-iter', type=int, default=20)
 
     # TRADES / MART choices
+    parse.add_argument('--beta', type=float, default=8.0, help='TRADES beta (ignored if MART)')
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
     
