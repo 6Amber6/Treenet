@@ -341,14 +341,9 @@ def make_eval_attack(model, args):
             self.base = base
         def forward(self, x): 
             # 确保梯度计算正常，但不强制改变模型模式
-            try:
-                with torch.enable_grad():
-                    _, _, fusion_logits = self.base(x)
-                return fusion_logits
-            except Exception as e:
-                print(f"Warning: FusionWrapper forward failed: {e}")
-                # 返回零logits作为fallback
-                return torch.zeros(x.size(0), 10, device=x.device, dtype=x.dtype)
+            with torch.enable_grad():
+                _, _, fusion_logits = self.base(x)
+            return fusion_logits
     crit = nn.CrossEntropyLoss()
     return create_attack(
         FusionWrapper(model), crit,
@@ -361,7 +356,9 @@ def make_eval_attack(model, args):
 def eval_adv(model, loader, attack) -> float:
     model.eval()
     tot, correct = 0, 0
-    for x, y in loader:
+    attack_failures = 0
+    
+    for batch_idx, (x, y) in enumerate(loader):
         x, y = x.to(DEVICE), y.to(DEVICE)
 
         try:
@@ -378,17 +375,27 @@ def eval_adv(model, loader, attack) -> float:
             torch.set_grad_enabled(False)
             model.eval()
             _, _, f_logits = model(x_adv)
+            
+            # 检查对抗样本是否真的不同
+            if torch.allclose(x_adv, x, atol=1e-6):
+                print(f"Warning: Adversarial samples identical to clean samples in batch {batch_idx}")
+                attack_failures += 1
+                
         except Exception as e:
-            print(f"Warning: Attack failed for batch, using clean samples: {e}")
+            print(f"Warning: Attack failed for batch {batch_idx}, using clean samples: {e}")
             torch.set_grad_enabled(False)
             model.eval()
             _, _, f_logits = model(x)
+            attack_failures += 1
         finally:
             torch.set_grad_enabled(False)
 
         correct += (f_logits.argmax(1) == y).sum().item()
         tot += y.size(0)
 
+    if attack_failures > 0:
+        print(f"Total attack failures: {attack_failures}/{len(loader)} batches")
+    
     return correct / max(tot, 1)
 
 
