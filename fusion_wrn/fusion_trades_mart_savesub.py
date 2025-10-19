@@ -263,7 +263,8 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
             super().__init__()
             self.base = base
         def forward(self, x): 
-            # 确保梯度计算正常
+            # 确保在训练模式下计算梯度
+            self.base.train()
             _, _, fusion_logits = self.base(x)
             return fusion_logits
 
@@ -339,7 +340,8 @@ def make_eval_attack(model, args):
             super().__init__()
             self.base = base
         def forward(self, x): 
-            # 确保梯度计算正常
+            # 确保在训练模式下计算梯度
+            self.base.train()
             _, _, fusion_logits = self.base(x)
             return fusion_logits
     crit = nn.CrossEntropyLoss()
@@ -352,21 +354,24 @@ def make_eval_attack(model, args):
     )
 
 def eval_adv(model, loader, attack) -> float:
-    model.eval()
     tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
         try:
+            model.train()
             x_adv, _ = attack.perturb(x, y)
+            if x_adv is None or torch.isnan(x_adv).any():
+                raise ValueError("Invalid adversarial samples generated.")
+            model.eval()
             _, _, f_logits = model(x_adv)
-            correct += (f_logits.argmax(1) == y).sum().item()
         except Exception as e:
             print(f"Warning: Attack failed for batch, using clean samples: {e}")
-            # 如果攻击失败，使用干净样本
+            model.eval()
             _, _, f_logits = model(x)
-            correct += (f_logits.argmax(1) == y).sum().item()
+        correct += (f_logits.argmax(1) == y).sum().item()
         tot += y.size(0)
     return correct / max(tot, 1)
+
 
 # --------------------------- Training Loops ----------------------------
 def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema: Optional[EMA]=None):
