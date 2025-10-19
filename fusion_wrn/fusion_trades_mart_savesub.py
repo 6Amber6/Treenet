@@ -1,5 +1,5 @@
-# fusion_trades_robust_mart.py
-# CIFAR-10 WRN-28-10 fusion + TRADES/MART with stronger PGD and normalized-space eps/step
+# fusion_trades_mart_savesub.py
+# CIFAR-10 WRN-28-10 fusion + TRADES/MART with submodel saving and manual training control
 # Default robust setup: PGD-20, step=0.01, eps=8/255; EMA decay=0.9995
 import os
 import sys
@@ -153,11 +153,25 @@ class FusionWRN(nn.Module):
         assert last1 is not None and last2 is not None, "Cannot find final FC layer on WRN (fc/linear)."
         self._h1 = last1.register_forward_hook(lambda m, inp, out: self._save('m1', inp))
         self._h2 = last2.register_forward_hook(lambda m, inp, out: self._save('m2', inp))
-    def _save(self, k, inp): self._feats[k] = inp[0]
+    def _save(self, k, inp): 
+        self._feats[k] = inp[0].detach().clone()
     def forward(self, x):
+        # 不要清空 _feats，让 hook 正常工作
         m1_logits = self.m1(x)
         m2_logits = self.m2(x)
-        z = torch.cat([self._feats['m1'], self._feats['m2']], dim=1)
+        
+        # Debug: Check if features were captured
+        if 'm1' not in self._feats or 'm2' not in self._feats:
+            print(f"WARNING: Hook failed! Available keys: {list(self._feats.keys())}")
+            # Fallback: manually extract features
+            with torch.no_grad():
+                # Get features before final FC layer
+                m1_feat = self.m1.relu(self.m1.bn1(self.m1.block3(self.m1.block2(self.m1.block1(self.m1.conv1(x))))))
+                m2_feat = self.m2.relu(self.m2.bn1(self.m2.block3(self.m2.block2(self.m2.block1(self.m2.conv1(x))))))
+                z = torch.cat([m1_feat, m2_feat], dim=1)
+        else:
+            z = torch.cat([self._feats['m1'], self._feats['m2']], dim=1)
+        
         fusion_logits = self.head(z)
         return m1_logits, m2_logits, fusion_logits
 
@@ -359,11 +373,13 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema: Opt
             logger.log(f'{tag} Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Acc {acc:.4f}')
 
 def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
+    # 恢复原来的学习率设置
     params = [
-        {'params': model.head.parameters(), 'lr': args.lr * 1.0},
-        {'params': model.m1.parameters(),   'lr': args.lr * 0.2},
-        {'params': model.m2.parameters(),   'lr': args.lr * 0.2},
+        {'params': model.head.parameters(), 'lr': args.lr * 1.0},  # 0.1 * 1.0 = 0.1
+        {'params': model.m1.parameters(),   'lr': args.lr * 0.2},  # 0.1 * 0.2 = 0.02
+        {'params': model.m2.parameters(),   'lr': args.lr * 0.2},  # 0.1 * 0.2 = 0.02
     ]
+    logger.log(f'Fusion learning rates - Head: {params[0]["lr"]:.4f}, M1: {params[1]["lr"]:.4f}, M2: {params[2]["lr"]:.4f}')
     opt = torch.optim.SGD(params, momentum=0.9, weight_decay=5e-4, nesterov=True)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs_g, eta_min=1e-6)
     ema = EMA(model, decay=args.ema_decay)
@@ -373,13 +389,25 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
     for ep in range(1, warmup_epochs + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
-        for x, y in train_loader:
+        for batch_idx, (x, y) in enumerate(train_loader):
             x, y = x.to(DEVICE), y.to(DEVICE)
             opt.zero_grad(set_to_none=True)
-            _, _, f_logits = model(x)
+            m1_logits, m2_logits, f_logits = model(x)
+            
+            # Debug first batch of first epoch
+            if ep == 1 and batch_idx == 0:
+                logger.log(f'Debug - M1 logits shape: {m1_logits.shape}, range: [{m1_logits.min():.3f}, {m1_logits.max():.3f}]')
+                logger.log(f'Debug - F logits shape: {f_logits.shape}, range: [{f_logits.min():.3f}, {f_logits.max():.3f}]')
+                logger.log(f'Debug - Labels: {y[:5].cpu().numpy()}')
+                logger.log(f'Debug - F predictions: {f_logits[:5].argmax(1).cpu().numpy()}')
+            
             loss = F.cross_entropy(f_logits, y)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            if ep == 1 and batch_idx == 0:
+                logger.log(f'Debug - Gradient norm: {grad_norm:.4f}')
+            
             opt.step()
             ema.update(model)
             total_loss += loss.item(); num_batches += 1
@@ -429,6 +457,37 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
                    f'Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} '
                    f'| Test Clean {clean:.4f} | Test Adv {adv:.4f}')
 
+# --------------------------- Submodel Loading/Saving --------------------
+def save_submodels(m1, m2, save_dir, logger):
+    """Save submodels M1 and M2"""
+    m1_path = os.path.join(save_dir, 'M1_WRN.pt')
+    m2_path = os.path.join(save_dir, 'M2_WRN.pt')
+    
+    torch.save({'model_state_dict': m1.state_dict()}, m1_path)
+    torch.save({'model_state_dict': m2.state_dict()}, m2_path)
+    
+    logger.log(f'Saved M1 to {m1_path}')
+    logger.log(f'Saved M2 to {m2_path}')
+
+def load_submodels(save_dir, logger):
+    """Load submodels M1 and M2"""
+    m1_path = os.path.join(save_dir, 'M1_WRN.pt')
+    m2_path = os.path.join(save_dir, 'M2_WRN.pt')
+    
+    if not os.path.exists(m1_path) or not os.path.exists(m2_path):
+        raise FileNotFoundError(f"Submodel files not found in {save_dir}")
+    
+    m1 = build_wrn_28_10(num_classes=len(animal_classes))
+    m2 = build_wrn_28_10(num_classes=len(vehicle_classes))
+    
+    m1.load_state_dict(torch.load(m1_path)['model_state_dict'])
+    m2.load_state_dict(torch.load(m2_path)['model_state_dict'])
+    
+    logger.log(f'Loaded M1 from {m1_path}')
+    logger.log(f'Loaded M2 from {m2_path}')
+    
+    return m1, m2
+
 # ------------------------------ Main -----------------------------------
 def main():
     parse = parser_train()
@@ -440,7 +499,6 @@ def main():
     parse.add_argument('--aux_w', type=float, default=0.02, help="weight for auxiliary CE loss")
     parse.add_argument('--ema-decay', type=float, default=0.9995, help="EMA decay for fusion model")
 
-
     # stronger PGD defaults
     parse.add_argument('--attack', type=str, default='linf-pgd')
     parse.add_argument('--attack-eps', type=float, default=8/255)
@@ -451,6 +509,12 @@ def main():
     parse.add_argument('--beta', type=float, default=8.0, help='TRADES beta (ignored if MART)')
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
+    
+    # NEW: Training control options
+    parse.add_argument('--train-mode', type=str, choices=['all', 'submodels', 'fusion'], default='all',
+                       help='Training mode: all=full pipeline, submodels=only M1/M2, fusion=only fusion')
+    parse.add_argument('--submodel-dir', type=str, default=None,
+                       help='Directory containing saved submodels (required for fusion-only mode)')
 
     args = parse.parse_args()
 
@@ -464,6 +528,7 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     logger.log(f'Using device: {DEVICE}')
+    logger.log(f'Training mode: {args.train_mode}')
     seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
@@ -480,25 +545,58 @@ def main():
     m2_train = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=True)
     m2_test  = build_filtered_loader(DATA_DIR, vehicle_classes, args.batch_size, train=False)
 
-    # ----------------- Train submodels -----------------
-    logger.log(f'Training M1 (WRN-28-10, 6-class) for {args.epochs_m} epochs (CE)')
-    m1 = build_wrn_28_10(num_classes=len(animal_classes))
-    train_ce(m1, m1_train, m1_test, args.epochs_m, args.lr_m, logger, '[M1]', ema=None)
+    # ----------------- Train/Load submodels -----------------
+    if args.train_mode in ['all', 'submodels']:
+        # Train submodels from scratch
+        logger.log(f'Training M1 (WRN-28-10, 6-class) for {args.epochs_m} epochs (CE)')
+        m1 = build_wrn_28_10(num_classes=len(animal_classes))
+        train_ce(m1, m1_train, m1_test, args.epochs_m, args.lr_m, logger, '[M1]', ema=None)
 
-    logger.log(f'Training M2 (WRN-28-10, 4-class) for {args.epochs_m} epochs (CE)')
-    m2 = build_wrn_28_10(num_classes=len(vehicle_classes))
-    train_ce(m2, m2_train, m2_test, args.epochs_m, args.lr_m, logger, '[M2]', ema=None)
+        logger.log(f'Training M2 (WRN-28-10, 4-class) for {args.epochs_m} epochs (CE)')
+        m2 = build_wrn_28_10(num_classes=len(vehicle_classes))
+        train_ce(m2, m2_train, m2_test, args.epochs_m, args.lr_m, logger, '[M2]', ema=None)
 
-    a_acc = eval_clean(m1, m1_test)
-    v_acc = eval_clean(m2, m2_test)
-    logger.log(f'[M1] Clean Test Acc: {a_acc:.4f}')
-    logger.log(f'[M2] Clean Test Acc: {v_acc:.4f}')
+        a_acc = eval_clean(m1, m1_test)
+        v_acc = eval_clean(m2, m2_test)
+        logger.log(f'[M1] Clean Test Acc: {a_acc:.4f}')
+        logger.log(f'[M2] Clean Test Acc: {v_acc:.4f}')
+        
+        # Save submodels
+        save_submodels(m1, m2, LOG_DIR, logger)
+        
+        if args.train_mode == 'submodels':
+            logger.log('Submodel training completed. Exiting.')
+            return
+            
+    elif args.train_mode == 'fusion':
+        # Load pre-trained submodels
+        if args.submodel_dir is None:
+            raise ValueError("--submodel-dir is required for fusion-only mode")
+        
+        logger.log(f'Loading pre-trained submodels from {args.submodel_dir}')
+        m1, m2 = load_submodels(args.submodel_dir, logger)
+        
+        # Quick evaluation of loaded models
+        a_acc = eval_clean(m1, m1_test)
+        v_acc = eval_clean(m2, m2_test)
+        logger.log(f'[M1] Loaded Clean Test Acc: {a_acc:.4f}')
+        logger.log(f'[M2] Loaded Clean Test Acc: {v_acc:.4f}')
 
     # ----------------- Fusion training -----------------
     in_dim = int(m1.fc.in_features if hasattr(m1, 'fc') else m1.linear.in_features) + \
              int(m2.fc.in_features if hasattr(m2, 'fc') else m2.linear.in_features)
+    logger.log(f'Fusion input dimension: {in_dim}')
     head = WRNHead(in_dim=in_dim, num_classes=10, p_drop=0.2).to(DEVICE)
     fusion = FusionWRN(m1, m2, head).to(DEVICE)
+    
+    # Test fusion model with a small batch
+    logger.log('Testing fusion model...')
+    with torch.no_grad():
+        test_x = torch.randn(2, 3, 32, 32).to(DEVICE)
+        m1_out, m2_out, f_out = fusion(test_x)
+        logger.log(f'Fusion test - M1 shape: {m1_out.shape}, M2 shape: {m2_out.shape}, F shape: {f_out.shape}')
+        logger.log(f'Fusion test - M1 logits range: [{m1_out.min():.3f}, {m1_out.max():.3f}]')
+        logger.log(f'Fusion test - F logits range: [{f_out.min():.3f}, {f_out.max():.3f}]')
 
     logger.log('Starting fusion training with {} (WRN-28-10 backbones)'.format('MART' if args.use_mart else 'TRADES'))
     train_fusion(fusion, full_train, full_test, args, logger)
