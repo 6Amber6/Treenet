@@ -499,11 +499,6 @@ def main():
     parse.add_argument('--aux_w', type=float, default=0.02, help="weight for auxiliary CE loss")
     parse.add_argument('--ema-decay', type=float, default=0.9995, help="EMA decay for fusion model")
 
-    # stronger PGD defaults
-    parse.add_argument('--attack', type=str, default='linf-pgd')
-    parse.add_argument('--attack-eps', type=float, default=8/255)
-    parse.add_argument('--attack-step', type=float, default=0.01)
-    parse.add_argument('--attack-iter', type=int, default=20)
 
     # TRADES / MART choices
     parse.add_argument('--beta', type=float, default=8.0, help='TRADES beta (ignored if MART)')
