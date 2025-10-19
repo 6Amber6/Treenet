@@ -501,7 +501,6 @@ def main():
 
 
     # TRADES / MART choices
-    parse.add_argument('--beta', type=float, default=8.0, help='TRADES beta (ignored if MART)')
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
     
