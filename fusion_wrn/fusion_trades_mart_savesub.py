@@ -269,8 +269,8 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
 
     # Craft with eval() so BN/dropout frozen for stability
     logits_model.eval()
-    with torch.no_grad():
-        p_nat = F.softmax(logits_model(x_natural), dim=1)
+    p_nat = F.softmax(logits_model(x_natural).detach(), dim=1)
+
 
     # PGD in normalized space with random start
     x_adv = (x_natural.detach() + 1e-3 * torch.randn_like(x_natural)).clamp(-5.0, 5.0)
