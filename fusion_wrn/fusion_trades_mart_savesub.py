@@ -354,25 +354,37 @@ def make_eval_attack(model, args):
     )
 
 def eval_adv(model, loader, attack) -> float:
+    model.eval()
     tot, correct = 0, 0
     for x, y in loader:
         x, y = x.to(DEVICE), y.to(DEVICE)
+
         try:
-            # 使用 torch.enable_grad() 确保梯度计算
-            with torch.enable_grad():
-                x_adv, _ = attack.perturb(x, y)
+            # 启用梯度，执行对抗样本生成
+            torch.set_grad_enabled(True)
+            x_adv, _ = attack.perturb(x, y)
+
+            # 若攻击器返回 None，表示PGD内部崩溃
             if x_adv is None or torch.isnan(x_adv).any():
-                raise ValueError("Invalid adversarial samples generated.")
+                raise ValueError("Invalid adversarial samples (None or NaN)")
+
+            # 禁用梯度后再评估模型
+            torch.set_grad_enabled(False)
             model.eval()
             _, _, f_logits = model(x_adv)
-            correct += (f_logits.argmax(1) == y).sum().item()
         except Exception as e:
             print(f"Warning: Attack failed for batch, using clean samples: {e}")
+            torch.set_grad_enabled(False)
             model.eval()
             _, _, f_logits = model(x)
-            correct += (f_logits.argmax(1) == y).sum().item()
+        finally:
+            torch.set_grad_enabled(False)
+
+        correct += (f_logits.argmax(1) == y).sum().item()
         tot += y.size(0)
+
     return correct / max(tot, 1)
+
 
 
 # --------------------------- Training Loops ----------------------------
