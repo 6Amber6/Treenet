@@ -256,14 +256,17 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
                     step_size_pix=2/255, epsilon_pix=8/255, perturb_steps=12,
                     beta=8.0, aux_w=0.02, use_mart: bool=False, label_smoothing: float=0.0):
     """
-    One adversarial training step for FusionWRN. If use_mart=True, swap TRADES robust term with MART loss.
+    One adversarial training step for FusionWRN. 
+    If use_mart=True, swap TRADES robust term with MART loss.
     """
+
     class LogitsOnly(nn.Module):
+        """Wrapper that returns only fusion logits for adversarial generation"""
         def __init__(self, base): 
             super().__init__()
             self.base = base
         def forward(self, x): 
-            # 确保梯度计算正常，但不强制改变模型模式
+            # enable grad to compute adversarial perturbations
             with torch.enable_grad():
                 _, _, fusion_logits = self.base(x)
             return fusion_logits
@@ -273,53 +276,63 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
     # Prepare normalized-space step/eps
     step_t, eps_t = _pixel_to_normed_step_and_eps(step_size_pix, epsilon_pix, DEVICE)
 
-    # Craft with eval() so BN/dropout frozen for stability
+    # -----------------------------
+    # 1️⃣ Compute natural prediction (detach but no no_grad)
+    # -----------------------------
     logits_model.eval()
-    with torch.no_grad():
-        p_nat = F.softmax(logits_model(x_natural), dim=1)
+    p_nat = F.softmax(logits_model(x_natural).detach(), dim=1)
+    # ✅ detach 保证 p_nat 固定但不反向传播
+    # ❌ 不要使用 with torch.no_grad()，否则梯度链会断
 
-
-    # PGD in normalized space with random start
+    # -----------------------------
+    # 2️⃣ Generate adversarial examples (PGD)
+    # -----------------------------
     x_adv = (x_natural.detach() + 1e-3 * torch.randn_like(x_natural)).clamp(-5.0, 5.0)
     for _ in range(perturb_steps):
         x_adv = x_adv.detach().clone().requires_grad_(True)
         logits_adv = logits_model(x_adv)
         # TRADES inner loss: KL(adv || nat)
         loss_kl = F.kl_div(F.log_softmax(logits_adv, dim=1), p_nat, reduction='batchmean')
+
         grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True, allow_unused=True)[0]
         if grad is None:
+            # fallback if grad not computed
             grad = torch.zeros_like(x_adv)
-            
+
         x_adv = x_adv.detach() + step_t * torch.sign(grad)
         x_adv = torch.max(torch.min(x_adv, x_natural + eps_t), x_natural - eps_t)
 
-    # Update
+    # -----------------------------
+    # 3️⃣ Fusion model training update
+    # -----------------------------
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
     m1_nat, m2_nat, f_nat = model(x_natural)
-    _,      _,     f_adv = model(x_adv)
+    _, _, f_adv = model(x_adv)
 
-    # natural CE (optionally with label smoothing)
-    if label_smoothing and label_smoothing > 0.0:
+    # natural CE (with optional label smoothing)
+    if label_smoothing > 0.0:
         loss_nat = F.cross_entropy(f_nat, y, label_smoothing=label_smoothing)
     else:
         loss_nat = F.cross_entropy(f_nat, y)
 
     if use_mart:
-        # MART robust term replaces TRADES KL, typically includes CE on adv with miscls weighting
+        # MART robust term
         loss_rob = mart_loss(f_adv, f_nat, y)
         loss = loss_nat + loss_rob + masked_aux_ce(m1_nat, m2_nat, y) * aux_w
     else:
         # TRADES robust term
-        loss_rob = F.kl_div(F.log_softmax(f_adv, dim=1), F.softmax(f_nat.detach(), dim=1), reduction='batchmean')
-        beta_val = beta if beta is not None else 8.0  # Default beta if None
-        loss = loss_nat + beta_val * loss_rob + masked_aux_ce(m1_nat, m2_nat, y) * aux_w
+        loss_rob = F.kl_div(F.log_softmax(f_adv, dim=1),
+                            F.softmax(f_nat.detach(), dim=1),
+                            reduction='batchmean')
+        loss = loss_nat + beta * loss_rob + masked_aux_ce(m1_nat, m2_nat, y) * aux_w
 
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
     optimizer.step()
     return float(loss.detach())
+
 
 # --------------------------- Eval --------------------------------------
 @torch.no_grad()
