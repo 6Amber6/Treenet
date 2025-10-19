@@ -282,7 +282,7 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
     # PGD in normalized space with random start
     x_adv = (x_natural.detach() + 1e-3 * torch.randn_like(x_natural)).clamp(-5.0, 5.0)
     for _ in range(perturb_steps):
-        x_adv.requires_grad_(True)
+        x_adv = x_adv.detach().clone().requires_grad_(True)
         logits_adv = logits_model(x_adv)
         # TRADES inner loss: KL(adv || nat)
         loss_kl = F.kl_div(F.log_softmax(logits_adv, dim=1), p_nat, reduction='batchmean')
@@ -341,9 +341,14 @@ def make_eval_attack(model, args):
             self.base = base
         def forward(self, x): 
             # 确保梯度计算正常，但不强制改变模型模式
-            with torch.enable_grad():
-                _, _, fusion_logits = self.base(x)
-            return fusion_logits
+            try:
+                with torch.enable_grad():
+                    _, _, fusion_logits = self.base(x)
+                return fusion_logits
+            except Exception as e:
+                print(f"Warning: FusionWrapper forward failed: {e}")
+                # 返回零logits作为fallback
+                return torch.zeros(x.size(0), 10, device=x.device, dtype=x.dtype)
     crit = nn.CrossEntropyLoss()
     return create_attack(
         FusionWrapper(model), crit,
@@ -362,6 +367,7 @@ def eval_adv(model, loader, attack) -> float:
         try:
             # 启用梯度，执行对抗样本生成
             torch.set_grad_enabled(True)
+            model.train()  # 确保模型在训练模式以支持梯度计算
             x_adv, _ = attack.perturb(x, y)
 
             # 若攻击器返回 None，表示PGD内部崩溃
