@@ -269,7 +269,8 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
 
     # Craft with eval() so BN/dropout frozen for stability
     logits_model.eval()
-    p_nat = F.softmax(logits_model(x_natural).detach(), dim=1)
+    with torch.no_grad():
+        p_nat = F.softmax(logits_model(x_natural), dim=1)
 
 
     # PGD in normalized space with random start
@@ -279,7 +280,10 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
         logits_adv = logits_model(x_adv)
         # TRADES inner loss: KL(adv || nat)
         loss_kl = F.kl_div(F.log_softmax(logits_adv, dim=1), p_nat, reduction='batchmean')
-        grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True)[0]
+        grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True, allow_unused=True)[0]
+        if grad is None:
+            grad = torch.zeros_like(x_adv)
+            
         x_adv = x_adv.detach() + step_t * torch.sign(grad)
         x_adv = torch.max(torch.min(x_adv, x_natural + eps_t), x_natural - eps_t)
 
