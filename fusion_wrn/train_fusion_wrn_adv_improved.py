@@ -285,11 +285,15 @@ def make_eval_attack(model, args):
         def __init__(self, base): super().__init__(); self.base = base
         def forward(self, x): return self.base(x)[-1]
     crit = nn.CrossEntropyLoss()
+    
+    # Use defaults for attack parameters if not specified
+    attack_type = getattr(args, 'attack', None) or 'linf-pgd'
+    attack_eps = getattr(args, 'attack_eps', None) or 8/255
+    attack_iter = getattr(args, 'attack_iter', None) or 20  # strong eval: PGD-20
+    attack_step = getattr(args, 'attack_step', None) or 2/255
+    
     return create_attack(FusionWrapper(model), crit,
-                         getattr(args, 'attack', 'linf-pgd'),
-                         getattr(args, 'attack_eps', 8/255),
-                         getattr(args, 'attack_iter', 20),   # strong eval: PGD-20
-                         getattr(args, 'attack_step', 2/255))
+                         attack_type, attack_eps, attack_iter, attack_step)
 
 def eval_adv(model, loader, attack) -> float:
     model.eval()
@@ -373,10 +377,15 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
             # Use default beta=8.0 if not specified
             beta_value = getattr(args, 'beta', None) or 8.0
             
+            # Use defaults for attack parameters if not specified
+            attack_step = getattr(args, 'attack_step', None) or 2/255
+            attack_eps = getattr(args, 'attack_eps', None) or 8/255
+            attack_iter = getattr(args, 'attack_iter', None) or 12
+            
             loss = adv_fusion_step(model, x, y, optimizer=opt,
-                                 step_size=getattr(args, 'attack_step', 2/255),
-                                 epsilon=getattr(args, 'attack_eps', 8/255),
-                                 perturb_steps=getattr(args, 'attack_iter', 12),
+                                 step_size=attack_step,
+                                 epsilon=attack_eps,
+                                 perturb_steps=attack_iter,
                                  beta=beta_value,
                                  aux_w=getattr(args, 'aux_w', 0.02),
                                  use_mart=getattr(args, 'use_mart', False),
@@ -450,14 +459,8 @@ def main():
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
     
-    # Note: --beta is already defined in parser_train() with default=None
-    # We'll use 8.0 as default in the code if beta is None
-    
-    # Attack parameters
-    parse.add_argument('--attack', type=str, default='linf-pgd', help='attack type for evaluation')
-    parse.add_argument('--attack-eps', type=float, default=8/255, help='attack epsilon')
-    parse.add_argument('--attack-step', type=float, default=2/255, help='attack step size')
-    parse.add_argument('--attack-iter', type=int, default=12, help='attack iterations')
+    # Note: --beta, --attack, --attack-eps, --attack-step, --attack-iter are already defined in parser_train()
+    # We'll use appropriate defaults in the code if they are None
 
     args = parse.parse_args()
 
