@@ -78,7 +78,7 @@ def _build_cifar10(data_dir, train: bool, num_workers=4, batch_size=128):
             T.RandomHorizontalFlip(),
             T.ToTensor(),
             T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-            T.RandomErasing(p=1.0, scale=(0.05, 0.10), ratio=(0.5, 2.0), value=0),
+            T.RandomErasing(p=0.2, scale=(0.05, 0.10), ratio=(0.5, 2.0), value=0),
         ])
     else:
         tfm = T.Compose([
@@ -452,9 +452,9 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema: Opt
             logger.log(f'{tag} Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Acc {acc:.4f}')
 
 def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
-    # 恢复原来的学习率设置
+    # 降低Head学习率，避免震荡
     params = [
-        {'params': model.head.parameters(), 'lr': args.lr * 1.0},  # 0.1 * 1.0 = 0.1
+        {'params': model.head.parameters(), 'lr': args.lr * 0.5},  # 0.1 * 0.5 = 0.05
         {'params': model.m1.parameters(),   'lr': args.lr * 0.2},  # 0.1 * 0.2 = 0.02
         {'params': model.m2.parameters(),   'lr': args.lr * 0.2},  # 0.1 * 0.2 = 0.02
     ]
@@ -491,19 +491,27 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
             ema.update(model)
             total_loss += loss.item(); num_batches += 1
         sch.step()
-        ema.apply_to(model)
-        clean = eval_clean(model, test_loader)
-        ema.restore(model)
+        # ✅ EMA 应该在 warm-up 第 5 epoch 后才参与评估
+        if ep > 5:
+            ema.apply_to(model)
+            clean = eval_clean(model, test_loader)
+            ema.restore(model)
+        else:
+            clean = eval_clean(model, test_loader)
         logger.log(f'[WRN-Fusion-CE] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f}')
 
-    # Disable head dropout for TRADES/MART, freeze BN stats, stronger attack
+    # Disable head dropout for TRADES/MART, stronger attack
     set_head_dropout_prob(model, 0.0)
-    freeze_backbone_bn(model)
 
-    atk_eval = make_eval_attack(model, args)
+    # 暂时跳过make_eval_attack，直接使用eval_adv_manual
+    # atk_eval = make_eval_attack(model, args)
     unfroze_bn = False
     for ep in range(warmup_epochs + 1, args.epochs_g + 1):
         model.train()
+        
+        # ✅ 延迟 10 epoch 后再冻结 BN
+        if ep == warmup_epochs + 10:
+            freeze_backbone_bn(model)
         total_loss, num_batches = 0.0, 0
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
@@ -527,14 +535,18 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
             unfroze_bn = True
 
         # EMA eval
-        ema.apply_to(model)
-        clean = eval_clean(model, test_loader)
-        # 使用手动PGD评估，确保攻击确实起作用
-        adv = eval_adv_manual(model, test_loader, 
-                             getattr(args, 'attack_step', 0.01),
-                             getattr(args, 'attack_eps', 8/255),
-                             getattr(args, 'attack_iter', 20))
-        ema.restore(model)
+        if ep > 5:
+            ema.apply_to(model)
+            clean = eval_clean(model, test_loader)
+            # ✅ 使用 eval_adv_manual 进行对抗评估
+            adv = eval_adv_manual(model, test_loader, 
+                                 getattr(args, 'attack_step', 0.01),
+                                 getattr(args, 'attack_eps', 8/255),
+                                 getattr(args, 'attack_iter', 20))
+            ema.restore(model)
+        else:
+            clean = eval_clean(model, test_loader)
+            adv = 0.0  # 前5个epoch不计算对抗准确率
 
         logger.log(f'[WRN-Fusion-{"MART" if args.use_mart else "TRADES"}] '
                    f'Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} '
