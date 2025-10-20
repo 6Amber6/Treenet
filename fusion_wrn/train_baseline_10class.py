@@ -40,7 +40,7 @@ def _build_cifar10(data_dir, train: bool, num_workers=4, batch_size=128):
             T.RandomHorizontalFlip(),
             T.ToTensor(),
             T.Normalize(CIFAR10_MEAN, CIFAR10_STD),
-            # 与 fusion 一致的随机擦除（Cutout 风格），对 TRADES 有轻微增益
+            # Cutout-style regularization that helps TRADES a bit
             T.RandomErasing(p=1.0, scale=(0.05, 0.10), ratio=(0.5, 2.0), value=0),
         ])
     else:
@@ -100,21 +100,12 @@ def unfreeze_bn(model: nn.Module):
         if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
             m.train()
 
-def _pixel_to_normed_step_and_eps(step_pix: float, eps_pix: float, device: torch.device):
-    """
-    Convert pixel-space step/eps to normalized-space tensors by dividing by std per-channel.
-    保持与 fusion 代码一致：在归一化空间进行 PGD。
-    """
-    std = torch.tensor(CIFAR10_STD, dtype=torch.float32, device=device).view(1, 3, 1, 1)
-    step = torch.tensor(step_pix, dtype=torch.float32, device=device).view(1, 1, 1, 1) / std
-    eps = torch.tensor(eps_pix, dtype=torch.float32, device=device).view(1, 1, 1, 1) / std
-    return step, eps
 
 # --------------------------- MART Loss ----------------------------------
 def mart_loss(logits_adv: torch.Tensor, logits_nat: torch.Tensor, y: torch.Tensor, lam: float = 5.0):
     """
     Misclassification Aware Adversarial Training loss
-    与你 fusion 里的实现保持一致：adv CE + margin hinge + KL
+    Consistent with fusion implementation: adv CE + margin hinge + KL
     """
     ce_adv = F.cross_entropy(logits_adv, y, reduction='none')
     prob_nat = F.softmax(logits_nat, dim=1)
@@ -138,47 +129,55 @@ def adv_step(model: nn.Module, x_natural, y, optimizer,
              step_size_pix=2/255, epsilon_pix=8/255, perturb_steps=12,
              beta=8.0, use_mart: bool=False, label_smoothing: float=0.0):
     """
-    对单模型进行一次对抗训练更新；与 fusion 版本保持相同 PGD 策略（归一化空间）。
+    Single model adversarial training step; PGD in pixel space, then normalize input.
     """
-    model_logits_only = model  # baseline 直接输出 logits
-
-    # 归一化空间 PGD 所需 step/eps
-    step_t, eps_t = _pixel_to_normed_step_and_eps(step_size_pix, epsilon_pix, DEVICE)
-
-    # 固定 BN/Dropout 做 PGD（数值更稳定）
+    model_logits_only = model  # baseline directly outputs logits
     model_logits_only.eval()
+
+    # Denormalize back to pixel space [0,1]
+    mean = torch.tensor(CIFAR10_MEAN, dtype=torch.float32, device=DEVICE).view(1, 3, 1, 1)
+    std  = torch.tensor(CIFAR10_STD, dtype=torch.float32, device=DEVICE).view(1, 3, 1, 1)
+    x_orig = x_natural * std + mean
+
     with torch.no_grad():
         p_nat = F.softmax(model_logits_only(x_natural), dim=1)
 
-    # 随机起点 + K 步 PGD
-    x_adv = (x_natural.detach() + 1e-3 * torch.randn_like(x_natural)).clamp(-5.0, 5.0)
+    # PGD perturbation in pixel space
+    x_adv = x_orig + 1e-3 * torch.randn_like(x_orig)
+    x_adv = torch.clamp(x_adv, 0.0, 1.0)
+
     for _ in range(perturb_steps):
         x_adv.requires_grad_(True)
-        logits_adv = model_logits_only(x_adv)
+        # Renormalize before forward pass
+        x_adv_norm = (x_adv - mean) / std
+        logits_adv = model_logits_only(x_adv_norm)
         loss_kl = F.kl_div(F.log_softmax(logits_adv, dim=1), p_nat, reduction='batchmean')
         grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True)[0]
-        x_adv = x_adv.detach() + step_t * torch.sign(grad)
-        x_adv = torch.max(torch.min(x_adv, x_natural + eps_t), x_natural - eps_t)
+        x_adv = x_adv.detach() + step_size_pix * torch.sign(grad)
+        x_adv = torch.min(torch.max(x_adv, x_orig - epsilon_pix), x_orig + epsilon_pix)
+        x_adv = torch.clamp(x_adv, 0.0, 1.0)
 
-    # 参数更新
+    # Normalize back to input distribution
+    x_adv_norm = (x_adv - mean) / std
+
+    # Parameter update
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
     f_nat = model(x_natural)
-    f_adv = model(x_adv)
+    f_adv = model(x_adv_norm)
 
-    # 自然项（可选 label smoothing）
-    if label_smoothing and label_smoothing > 0.0:
+    if label_smoothing > 0.0:
         loss_nat = F.cross_entropy(f_nat, y, label_smoothing=label_smoothing)
     else:
         loss_nat = F.cross_entropy(f_nat, y)
 
-    # 鲁棒项：MART 或 TRADES
     if use_mart:
         loss_rob = mart_loss(f_adv, f_nat, y)
         loss = loss_nat + loss_rob
     else:
-        loss_rob = F.kl_div(F.log_softmax(f_adv, dim=1), F.softmax(f_nat.detach(), dim=1), reduction='batchmean')
+        loss_rob = F.kl_div(F.log_softmax(f_adv, dim=1),
+                            F.softmax(f_nat.detach(), dim=1), reduction='batchmean')
         loss = loss_nat + beta * loss_rob
 
     loss.backward()
@@ -202,7 +201,7 @@ def make_eval_attack(model, args):
     crit = nn.CrossEntropyLoss()
     attack_type = getattr(args, 'attack', None) or 'linf-pgd'
     attack_eps = getattr(args, 'attack_eps', None) or 8/255
-    attack_iter = getattr(args, 'attack_iter', None) or 20  # 强评估：PGD-20
+    attack_iter = getattr(args, 'attack_iter', None) or 20  # Strong evaluation: PGD-20
     attack_step = getattr(args, 'attack_step', None) or 2/255
     return create_attack(model, crit, attack_type, attack_eps, attack_iter, attack_step)
 
@@ -219,12 +218,12 @@ def eval_adv(model, loader, attack) -> float:
 
 # --------------------------- Training Loop ------------------------------
 def train_baseline(model, train_loader, test_loader, args, logger):
-    # 优化器与调度
+    # Optimizer and scheduler
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     ema = EMA(model, decay=getattr(args, 'ema_decay', 0.9995))
 
-    # 先 CE warmup（与 fusion 保持一致：最多 10 个 epoch）
+    # CE warmup first (consistent with fusion: max 10 epochs)
     warmup_epochs = min(10, args.epochs)
     for ep in range(1, warmup_epochs + 1):
         model.train()
@@ -243,16 +242,16 @@ def train_baseline(model, train_loader, test_loader, args, logger):
         ema.apply_to(model); clean = eval_clean(model, test_loader); ema.restore(model)
         logger.log(f'[WRN10-CE] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f}')
 
-    # 对抗阶段：禁用 Dropout（WRN 内置 dropout 仍由 train() 控制，这里额外确保 BN 统计冻结以稳定 PGD）
+    # Adversarial phase: disable Dropout (WRN built-in dropout still controlled by train(), here ensure BN stats frozen for stable PGD)
     freeze_bn(model)
     atk_eval = make_eval_attack(model, args)
 
-    # 如果是 MART，做一点初始化对齐（可选但与 fusion 对齐）
+    # If MART, do some initialization alignment (optional but aligned with fusion)
     if getattr(args, 'use_mart', False):
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
                 m.reset_running_stats()
-        # 适当降低学习率
+        # Appropriately reduce learning rate
         for pg in opt.param_groups:
             pg['lr'] *= 0.1
         logger.log(f'[MART-Init] Reset BN stats and reduced LR to {opt.param_groups[0]["lr"]:.6f}')
@@ -263,7 +262,7 @@ def train_baseline(model, train_loader, test_loader, args, logger):
     for ep in range(warmup_epochs + 1, args.epochs + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
-        # 默认参数
+        # Default parameters
         base_attack_step = getattr(args, 'attack_step', None) or 2/255
         base_attack_eps  = getattr(args, 'attack_eps', None)  or 8/255
         base_attack_iter = getattr(args, 'attack_iter', None) or 12
@@ -272,7 +271,7 @@ def train_baseline(model, train_loader, test_loader, args, logger):
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
 
-            # MART 前期逐步增强攻击强度（与 fusion 对齐）
+            # MART early stage gradual attack strength increase (aligned with fusion)
             if getattr(args, 'use_mart', False) and (ep - warmup_epochs) <= 10:
                 attack_step = base_attack_step * 0.5
                 attack_eps  = base_attack_eps * 0.5
@@ -294,12 +293,12 @@ def train_baseline(model, train_loader, test_loader, args, logger):
 
         sch.step()
 
-        # 对抗阶段 40 个 epoch 后解冻 BN，让统计量适应（与 fusion 对齐）
+        # Unfreeze BN after 40 epochs in adversarial phase to let stats adapt (aligned with fusion)
         if not unfroze_bn and (ep - warmup_epochs) >= 40:
             unfreeze_bn(model)
             unfroze_bn = True
 
-        # EMA 评估
+        # EMA evaluation
         ema.apply_to(model)
         clean = eval_clean(model, test_loader)
         adv   = eval_adv(model, test_loader, atk_eval)
@@ -316,12 +315,12 @@ def train_baseline(model, train_loader, test_loader, args, logger):
 # ------------------------------ Main -----------------------------------
 def main():
     parse = parser_train()
-    # 统一配置：与 fusion 代码风格一致
+    # Unified configuration: consistent with fusion code style
     parse.add_argument('--epochs', type=int, default=120, help='total epochs for baseline WRN-10 (CE warmup + ADV)')
     parse.add_argument('--ema-decay', type=float, default=0.9995, help='EMA decay')
     parse.add_argument('--use-mart', action='store_true', help='use MART (else TRADES)')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
-    parse.add_argument('--workers', type=int, default=4, help='DataLoader workers (set 0 if容器中易死锁)')
+    parse.add_argument('--workers', type=int, default=4, help='DataLoader workers (set 0 if deadlock in container)')
 
     args = parse.parse_args()
 
@@ -338,7 +337,7 @@ def main():
     seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
-    # Dataloaders（保持一致的 transforms / workers）
+    # Dataloaders (consistent transforms / workers)
     _, train_loader = _build_cifar10(DATA_DIR, train=True,
                                      num_workers=getattr(args, 'workers', 4),
                                      batch_size=args.batch_size)
