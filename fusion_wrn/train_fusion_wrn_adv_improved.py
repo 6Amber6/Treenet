@@ -370,11 +370,14 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
         total_loss, num_batches = 0.0, 0
         for x, y in train_loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
+            # Use default beta=8.0 if not specified
+            beta_value = getattr(args, 'beta', None) or 8.0
+            
             loss = adv_fusion_step(model, x, y, optimizer=opt,
                                  step_size=getattr(args, 'attack_step', 2/255),
                                  epsilon=getattr(args, 'attack_eps', 8/255),
                                  perturb_steps=getattr(args, 'attack_iter', 12),
-                                 beta=getattr(args, 'beta', 8.0),
+                                 beta=beta_value,
                                  aux_w=getattr(args, 'aux_w', 0.02),
                                  use_mart=getattr(args, 'use_mart', False),
                                  label_smoothing=getattr(args, 'label_smoothing', 0.0))
@@ -445,8 +448,10 @@ def main():
     
     # Adversarial training method
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
-    parse.add_argument('--beta', type=float, default=8.0, help='TRADES beta (ignored if MART)')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
+    
+    # Note: --beta is already defined in parser_train() with default=None
+    # We'll use 8.0 as default in the code if beta is None
     
     # Attack parameters
     parse.add_argument('--attack', type=str, default='linf-pgd', help='attack type for evaluation')
