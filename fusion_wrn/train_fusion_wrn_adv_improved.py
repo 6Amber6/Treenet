@@ -369,6 +369,18 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
     unfroze_bn = False
     method_name = 'MART' if getattr(args, 'use_mart', False) else 'TRADES'
     
+    # MART-specific initialization
+    if getattr(args, 'use_mart', False):
+        # Reset BN stats for MART phase
+        for module in model.modules():
+            if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                module.reset_running_stats()
+        
+        # Lower learning rate for MART phase
+        for param_group in opt.param_groups:
+            param_group['lr'] *= 0.1
+        logger.log(f'[MART-Init] Reset BN stats and reduced LR to {opt.param_groups[0]["lr"]:.6f}')
+    
     for ep in range(warmup_epochs + 1, args.epochs_g + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
@@ -378,9 +390,19 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
             beta_value = getattr(args, 'beta', None) or 8.0
             
             # Use defaults for attack parameters if not specified
-            attack_step = getattr(args, 'attack_step', None) or 2/255
-            attack_eps = getattr(args, 'attack_eps', None) or 8/255
-            attack_iter = getattr(args, 'attack_iter', None) or 12
+            base_attack_step = getattr(args, 'attack_step', None) or 2/255
+            base_attack_eps = getattr(args, 'attack_eps', None) or 8/255
+            base_attack_iter = getattr(args, 'attack_iter', None) or 12
+            
+            # MART: Gradual attack strength increase for first 10 epochs
+            if getattr(args, 'use_mart', False) and (ep - warmup_epochs) <= 10:
+                attack_step = base_attack_step * 0.5  # 1/255
+                attack_eps = base_attack_eps * 0.5   # 4/255
+                attack_iter = max(7, base_attack_iter // 2)  # 7 iterations
+            else:
+                attack_step = base_attack_step
+                attack_eps = base_attack_eps
+                attack_iter = base_attack_iter
             
             loss = adv_fusion_step(model, x, y, optimizer=opt,
                                  step_size=attack_step,
@@ -405,7 +427,11 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
         adv   = eval_adv(model, test_loader, atk_eval)
         ema.restore(model)
 
-        logger.log(f'[WRN-Fusion-{method_name}] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f} | Test Adv {adv:.4f}')
+        # Log attack parameters for MART
+        if getattr(args, 'use_mart', False) and (ep - warmup_epochs) <= 10:
+            logger.log(f'[WRN-Fusion-{method_name}] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f} | Test Adv {adv:.4f} | Attack: eps={attack_eps:.3f}, step={attack_step:.3f}, iter={attack_iter}')
+        else:
+            logger.log(f'[WRN-Fusion-{method_name}] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f} | Test Adv {adv:.4f}')
 
 # --------------------------- Model Loading/Saving ------------------------
 def save_submodels(m1, m2, save_dir, logger):
