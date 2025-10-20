@@ -238,7 +238,7 @@ def train_baseline(model, train_loader, test_loader, args, logger):
             opt.step()
             ema.update(model)
             total_loss += loss.item(); num_batches += 1
-        sch.step()
+        # Don't step scheduler during warmup
         ema.apply_to(model); clean = eval_clean(model, test_loader); ema.restore(model)
         logger.log(f'[WRN10-CE] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f}')
 
