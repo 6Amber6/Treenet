@@ -318,7 +318,6 @@ def main():
     parse = parser_train()
     # 统一配置：与 fusion 代码风格一致
     parse.add_argument('--epochs', type=int, default=120, help='total epochs for baseline WRN-10 (CE warmup + ADV)')
-    parse.add_argument('--lr', type=float, default=0.1, help='learning rate for baseline model')
     parse.add_argument('--ema-decay', type=float, default=0.9995, help='EMA decay')
     parse.add_argument('--use-mart', action='store_true', help='use MART (else TRADES)')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
