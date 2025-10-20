@@ -259,6 +259,8 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
     One adversarial training step for FusionWRN. 
     If use_mart=True, swap TRADES robust term with MART loss.
     """
+    # 🔎 额外防御：防止全局梯度被关闭
+    assert torch.is_grad_enabled(), "Grad is globally disabled. Do not call torch.set_grad_enabled(False) outside a context."
 
     class LogitsOnly(nn.Module):
         """Wrapper that returns only fusion logits for adversarial generation"""
@@ -294,17 +296,8 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
         # TRADES inner loss: KL(adv || nat)
         loss_kl = F.kl_div(F.log_softmax(logits_adv, dim=1), p_nat, reduction='batchmean')
 
-        try:
-            grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True, allow_unused=True)[0]
-            if grad is None:
-                # fallback if grad not computed
-                grad = torch.zeros_like(x_adv)
-        except RuntimeError as e:
-            if "does not require grad" in str(e) or "no grad_fn" in str(e):
-                # PyTorch 2.x compatibility: handle gradient computation issues
-                grad = torch.zeros_like(x_adv)
-            else:
-                raise e
+        # PGD 内部的 grad 安全检查：一旦图断了会立即抛错，更容易定位
+        grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True, allow_unused=False)[0]
 
         x_adv = x_adv.detach() + step_t * torch.sign(grad)
         x_adv = torch.max(torch.min(x_adv, x_natural + eps_t), x_natural - eps_t)
@@ -355,74 +348,78 @@ def eval_clean(model, loader) -> float:
     return correct / max(tot, 1)
 
 def make_eval_attack(model, args):
+    """
+    创建一个安全的攻击包装器，保证攻击器拿到的输出是单一的 logits Tensor。
+    """
     class FusionWrapper(nn.Module):
-        def __init__(self, base): 
+        def __init__(self, base):
             super().__init__()
             self.base = base
-        def forward(self, x): 
-            # 确保梯度计算正常，但不强制改变模型模式
-            # PyTorch 2.x compatibility: ensure proper gradient computation
-            try:
-                with torch.enable_grad():
-                    _, _, fusion_logits = self.base(x)
-                return fusion_logits
-            except Exception as e:
-                # Fallback for PyTorch 2.x compatibility issues
-                print(f"Warning: FusionWrapper forward failed: {e}")
-                # Return zero logits as fallback
-                return torch.zeros(x.size(0), 10, device=x.device, dtype=x.dtype)
+
+        def forward(self, x):
+            # ✅ 返回纯 logits tensor（最后一项），并显式启用梯度
+            with torch.enable_grad():
+                out = self.base(x)
+                if isinstance(out, (tuple, list)):
+                    out = out[-1]
+            return out
+
     crit = nn.CrossEntropyLoss()
     return create_attack(
         FusionWrapper(model), crit,
         getattr(args, 'attack', 'linf-pgd'),
         getattr(args, 'attack_eps', 8/255),
-        getattr(args, 'attack_iter', 20),   # strong eval: PGD-20
+        getattr(args, 'attack_iter', 20),   # PGD-20
         getattr(args, 'attack_step', 0.01)
     )
 
 def eval_adv(model, loader, attack) -> float:
+    """
+    对抗评估阶段。
+    - 攻击生成阶段：with torch.enable_grad()
+    - 模型评估阶段：with torch.no_grad()
+    - ❌ 不使用 torch.set_grad_enabled(False) 之类的全局开关
+    """
     model.eval()
     tot, correct = 0, 0
     attack_failures = 0
-    
+
     for batch_idx, (x, y) in enumerate(loader):
         x, y = x.to(DEVICE), y.to(DEVICE)
 
         try:
-            # 启用梯度，执行对抗样本生成
-            torch.set_grad_enabled(True)
-            model.train()  # 确保模型在训练模式以支持梯度计算
-            x_adv, _ = attack.perturb(x, y)
+            # ✅ 仅在这段内开启梯度（用于PGD迭代）
+            with torch.enable_grad():
+                model.train()  # 让BN/Dropout按训练姿态生成对抗样本
+                x_adv, _ = attack.perturb(x, y)
 
-            # 若攻击器返回 None，表示PGD内部崩溃
             if x_adv is None or torch.isnan(x_adv).any():
                 raise ValueError("Invalid adversarial samples (None or NaN)")
 
-            # 禁用梯度后再评估模型
-            torch.set_grad_enabled(False)
+            # ✅ 评估阶段不需要梯度
             model.eval()
-            _, _, f_logits = model(x_adv)
-            
-            # 检查对抗样本是否真的不同
+            with torch.no_grad():
+                out = model(x_adv)
+                f_logits = out[-1] if isinstance(out, (tuple, list)) else out
+
             if torch.allclose(x_adv, x, atol=1e-6):
                 print(f"Warning: Adversarial samples identical to clean samples in batch {batch_idx}")
                 attack_failures += 1
-                
+
         except Exception as e:
             print(f"Warning: Attack failed for batch {batch_idx}, using clean samples: {e}")
-            torch.set_grad_enabled(False)
             model.eval()
-            _, _, f_logits = model(x)
+            with torch.no_grad():
+                out = model(x)
+                f_logits = out[-1] if isinstance(out, (tuple, list)) else out
             attack_failures += 1
-        finally:
-            torch.set_grad_enabled(False)
 
         correct += (f_logits.argmax(1) == y).sum().item()
         tot += y.size(0)
 
     if attack_failures > 0:
         print(f"Total attack failures: {attack_failures}/{len(loader)} batches")
-    
+
     return correct / max(tot, 1)
 
 
