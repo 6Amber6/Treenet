@@ -268,10 +268,8 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
             super().__init__()
             self.base = base
         def forward(self, x): 
-            # enable grad to compute adversarial perturbations
-            with torch.enable_grad():
-                _, _, fusion_logits = self.base(x)
-            return fusion_logits
+            # 直接返回最后一个元素，保持简单
+            return self.base(x)[-1]
 
     logits_model = LogitsOnly(model).to(DEVICE)
 
@@ -279,32 +277,23 @@ def adv_fusion_step(model: FusionWRN, x_natural, y, optimizer,
     step_t, eps_t = _pixel_to_normed_step_and_eps(step_size_pix, epsilon_pix, DEVICE)
 
     # -----------------------------
-    # 1️⃣ Compute natural prediction (detach but no no_grad)
+    # 1️⃣ Compute natural prediction (使用正确的方式)
     # -----------------------------
-    # 先冻结 BN 和 dropout，但允许梯度
+    # 按照train_fusion_wrn_adv.py的正确实现
     logits_model.eval()
     with torch.no_grad():
-        logits_nat = logits_model(x_natural)
-    p_nat = F.softmax(logits_nat.detach(), dim=1)
-    # ✅ 只在计算 logits_nat 时 no_grad（因为 nat logits 不需要反传）
-    # ✅ p_nat 是 detach 后的 softmax，不影响后续计算图
-    # ✅ 此时模型参数的 autograd 依然完好，后续对 x_adv 的 forward 可以正常反传
+        p_nat = F.softmax(logits_model(x_natural), dim=1)
 
     # -----------------------------
-    # 2️⃣ Generate adversarial examples (PGD)
+    # 2️⃣ Generate adversarial examples (PGD) - 按照正确版本实现
     # -----------------------------
     x_adv = (x_natural.detach() + 1e-3 * torch.randn_like(x_natural)).clamp(-5.0, 5.0)
     for _ in range(perturb_steps):
-        x_adv = x_adv.detach().clone().requires_grad_(True)
+        x_adv.requires_grad_(True)
         logits_adv = logits_model(x_adv)
         # TRADES inner loss: KL(adv || nat)
         loss_kl = F.kl_div(F.log_softmax(logits_adv, dim=1), p_nat, reduction='batchmean')
-
-        # PGD 内部的 grad 安全检查：使用 allow_unused=True 防止硬中断
-        grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True, allow_unused=True)[0]
-        if grad is None:
-            grad = torch.zeros_like(x_adv)
-
+        grad = torch.autograd.grad(loss_kl, x_adv, only_inputs=True)[0]
         x_adv = x_adv.detach() + step_t * torch.sign(grad)
         x_adv = torch.max(torch.min(x_adv, x_natural + eps_t), x_natural - eps_t)
 
