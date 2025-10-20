@@ -1,6 +1,6 @@
-# train_baseline_10class_adv_improved.py
-# Direct 10-class baseline with MART/TRADES switching for comparison with fusion model
-# All parameters kept identical to train_fusion_wrn_adv_improved.py
+# train_baseline_10class.py
+# Direct 10-class baseline experiment for comparison with train_fusion_wrn_adv_improved.py
+# Uses single WRN-28-10 model on full CIFAR-10 dataset with same parameters
 
 import os
 import sys
@@ -54,7 +54,7 @@ def _build_cifar10(data_dir, train: bool, num_workers=4, batch_size=128):
     return ds, loader
 
 # ------------------------------ Models ----------------------------------
-def build_wrn_28_10(num_classes: int):
+def build_wrn_28_10(num_classes: int = 10):
     model = wideresnet('wideresnet-28-10', num_classes=num_classes, device=DEVICE)
     return model.to(DEVICE)
 
@@ -85,17 +85,6 @@ class EMA:
             if p.requires_grad and n in self.backup:
                 p.data = self.backup[n]
 
-# --------------------------- Utilities ----------------------------------
-def freeze_backbone_bn(model):
-    for module in model.modules():
-        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            module.eval()
-
-def unfreeze_backbone_bn(model):
-    for module in model.modules():
-        if isinstance(module, (nn.BatchNorm2d, nn.BatchNorm1d)):
-            module.train()
-
 # --------------------------- MART Loss Implementation -------------------
 def mart_loss(logits_adv: torch.Tensor, logits_nat: torch.Tensor, y: torch.Tensor, lam: float = 5.0):
     """
@@ -125,11 +114,11 @@ def mart_loss(logits_adv: torch.Tensor, logits_nat: torch.Tensor, y: torch.Tenso
     return (ce_adv + loss_miscls).mean() + kl
 
 # --------------------------- Adversarial Training Step ------------------
-def adv_baseline_step(model, x_natural, y, optimizer,
-                     step_size=2/255, epsilon=8/255, perturb_steps=12,
-                     beta=8.0, use_mart=False, label_smoothing=0.0):
+def adv_step(model, x_natural, y, optimizer,
+             step_size=2/255, epsilon=8/255, perturb_steps=12,
+             beta=8.0, use_mart=False, label_smoothing=0.0):
     """
-    Unified adversarial training step supporting both TRADES and MART for baseline 10-class model
+    Unified adversarial training step supporting both TRADES and MART
     """
     # Craft adversarial examples with eval() so BN/dropout frozen
     model.eval()
@@ -230,13 +219,13 @@ def train_ce(model, train_loader, test_loader, epochs, lr, logger, tag, ema=None
             if ema: ema.restore(model)
             logger.log(f'{tag} Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Acc {acc:.4f}')
 
-def train_baseline(model, train_loader, test_loader, args, logger):
+def train_adv(model, train_loader, test_loader, args, logger):
     opt = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4, nesterov=True)
-    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs_g, eta_min=1e-6)
+    sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     ema = EMA(model, decay=getattr(args, 'ema_decay', 0.999))
 
     # CE warmup
-    warmup_epochs = min(10, args.epochs_g)
+    warmup_epochs = min(10, args.epochs)
     for ep in range(1, warmup_epochs + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
@@ -256,11 +245,7 @@ def train_baseline(model, train_loader, test_loader, args, logger):
         ema.restore(model)
         logger.log(f'[WRN-Baseline-CE] Epoch {ep:03d} | Train Loss {total_loss/max(num_batches,1):.4f} | Test Clean {clean:.4f}')
 
-    # Freeze BN stats for adversarial training
-    freeze_backbone_bn(model)
-
     atk_eval = make_eval_attack(model, args)
-    unfroze_bn = False
     method_name = 'MART' if getattr(args, 'use_mart', False) else 'TRADES'
     
     # MART-specific initialization
@@ -275,7 +260,7 @@ def train_baseline(model, train_loader, test_loader, args, logger):
             param_group['lr'] *= 0.1
         logger.log(f'[MART-Init] Reset BN stats and reduced LR to {opt.param_groups[0]["lr"]:.6f}')
     
-    for ep in range(warmup_epochs + 1, args.epochs_g + 1):
+    for ep in range(warmup_epochs + 1, args.epochs + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
         for x, y in train_loader:
@@ -298,21 +283,16 @@ def train_baseline(model, train_loader, test_loader, args, logger):
                 attack_eps = base_attack_eps
                 attack_iter = base_attack_iter
             
-            loss = adv_baseline_step(model, x, y, optimizer=opt,
-                                   step_size=attack_step,
-                                   epsilon=attack_eps,
-                                   perturb_steps=attack_iter,
-                                   beta=beta_value,
-                                   use_mart=getattr(args, 'use_mart', False),
-                                   label_smoothing=getattr(args, 'label_smoothing', 0.0))
+            loss = adv_step(model, x, y, optimizer=opt,
+                           step_size=attack_step,
+                           epsilon=attack_eps,
+                           perturb_steps=attack_iter,
+                           beta=beta_value,
+                           use_mart=getattr(args, 'use_mart', False),
+                           label_smoothing=getattr(args, 'label_smoothing', 0.0))
             ema.update(model)
             total_loss += float(loss); num_batches += 1
         sch.step()
-
-        # Unfreeze BN after 40 adversarial epochs to let stats adapt
-        if not unfroze_bn and (ep - warmup_epochs) >= 40:
-            unfreeze_backbone_bn(model)
-            unfroze_bn = True
 
         # EMA eval
         ema.apply_to(model)
@@ -330,16 +310,16 @@ def train_baseline(model, train_loader, test_loader, args, logger):
 def main():
     parse = parser_train()
 
-    # Training parameters (same as fusion model)
-    parse.add_argument('--epochs-g', type=int, default=120, help="epochs for baseline model")
-    parse.add_argument('--ema-decay', type=float, default=0.999, help="EMA decay for baseline model")
+    # Training parameters - keep same as fusion version
+    parse.add_argument('--epochs', type=int, default=120, help="epochs for training")
+    parse.add_argument('--lr', type=float, default=0.1, help="learning rate")
+    parse.add_argument('--ema-decay', type=float, default=0.999, help="EMA decay")
     
-    # Adversarial training method (same as fusion model)
+    # Adversarial training method
     parse.add_argument('--use-mart', action='store_true', help='use MART robust loss instead of TRADES')
     parse.add_argument('--label-smoothing', type=float, default=0.0, help='label smoothing on natural CE')
     
     # Note: --beta, --attack, --attack-eps, --attack-step, --attack-iter are already defined in parser_train()
-    # We'll use appropriate defaults in the code if they are None
 
     args = parse.parse_args()
 
@@ -358,37 +338,35 @@ def main():
         json.dump(vars(args), f, indent=2)
 
     logger.log(f'Using device: {DEVICE}')
-    logger.log(f'Training mode: baseline 10-class WRN-28-10')
     logger.log(f'Method: {"MART" if args.use_mart else "TRADES"}')
+    logger.log(f'Baseline: Direct 10-class WRN-28-10')
     seed(args.seed)
     torch.backends.cudnn.benchmark = True
 
     # ----------------- Dataloaders -----------------
-    _, full_train = _build_cifar10(DATA_DIR, train=True,
-                                   num_workers=getattr(args, 'workers', 4),
-                                   batch_size=args.batch_size)
-    _, full_test  = _build_cifar10(DATA_DIR, train=False,
-                                   num_workers=getattr(args, 'workers', 4),
-                                   batch_size=args.batch_size)
+    _, train_loader = _build_cifar10(DATA_DIR, train=True,
+                                    num_workers=getattr(args, 'workers', 4),
+                                    batch_size=args.batch_size)
+    _, test_loader  = _build_cifar10(DATA_DIR, train=False,
+                                    num_workers=getattr(args, 'workers', 4),
+                                    batch_size=args.batch_size)
 
-    # ----------------- Train baseline model -----------------
-    logger.log(f'Training baseline WRN-28-10 (10-class) for {args.epochs_g} epochs')
+    # ----------------- Model -----------------
     model = build_wrn_28_10(num_classes=10)
 
     method_name = 'MART' if args.use_mart else 'TRADES'
-    logger.log(f'Starting baseline training with {method_name} (WRN-28-10)')
-    train_baseline(model, full_train, full_test, args, logger)
+    logger.log(f'Starting baseline training with {method_name} (WRN-28-10, 10-class)')
+    train_adv(model, train_loader, test_loader, args, logger)
 
     # ----------------- Final Eval & Save -----------------
     atk = make_eval_attack(model, args)
-    clean = eval_clean(model, full_test)
-    adv   = eval_adv(model, full_test, atk)
+    clean = eval_clean(model, test_loader)
+    adv   = eval_adv(model, test_loader, atk)
     logger.log(f'[WRN-Baseline] Final Test Clean {clean:.4f} | Adv {adv:.4f}')
 
     # Save model
-    torch.save({'model_state_dict': model.state_dict()}, os.path.join(LOG_DIR, 'Baseline_WRN.pt'))
-    logger.log(f'Saved baseline model to {LOG_DIR}')
-
+    torch.save({'model_state_dict': model.state_dict()}, os.path.join(LOG_DIR, 'WRN_Baseline.pt'))
+    logger.log(f'Saved model to {LOG_DIR}')
 
 if __name__ == '__main__':
     main()
