@@ -312,7 +312,6 @@ def main():
 
     # Training parameters - keep same as fusion version
     parse.add_argument('--epochs', type=int, default=120, help="epochs for training")
-    parse.add_argument('--lr', type=float, default=0.1, help="learning rate")
     parse.add_argument('--ema-decay', type=float, default=0.999, help="EMA decay")
     
     # Adversarial training method
