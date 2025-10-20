@@ -154,7 +154,7 @@ class FusionWRN(nn.Module):
         self._h1 = last1.register_forward_hook(lambda m, inp, out: self._save('m1', inp))
         self._h2 = last2.register_forward_hook(lambda m, inp, out: self._save('m2', inp))
     def _save(self, k, inp): 
-        self._feats[k] = inp[0].detach().clone()
+        self._feats[k] = inp[0]  # 移除detach()，确保梯度通路完整
     def forward(self, x):
         # 不要清空 _feats，让 hook 正常工作
         m1_logits = self.m1(x)
@@ -379,54 +379,62 @@ def make_eval_attack(model, args):
         getattr(args, 'attack_step', 0.01)
     )
 
-def eval_adv(model, loader, attack) -> float:
+def eval_adv_manual(model, loader, step_size_pix, epsilon_pix, perturb_steps):
     """
-    对抗评估阶段。
-    - 攻击生成阶段：with torch.enable_grad()
-    - 模型评估阶段：with torch.no_grad()
-    - ❌ 不使用 torch.set_grad_enabled(False) 之类的全局开关
+    手动实现PGD攻击评估，确保攻击确实起作用
     """
     model.eval()
     tot, correct = 0, 0
-    attack_failures = 0
-
+    step_t, eps_t = _pixel_to_normed_step_and_eps(step_size_pix, epsilon_pix, DEVICE)
+    
     for batch_idx, (x, y) in enumerate(loader):
         x, y = x.to(DEVICE), y.to(DEVICE)
-
-        try:
-            # ✅ 仅在这段内开启梯度（用于PGD迭代）
-            with torch.enable_grad():
-                model.train()  # 让BN/Dropout按训练姿态生成对抗样本
-                x_adv, _ = attack.perturb(x, y)
-
-            if x_adv is None or torch.isnan(x_adv).any():
-                raise ValueError("Invalid adversarial samples (None or NaN)")
-
-            # ✅ 评估阶段不需要梯度
-            model.eval()
-            with torch.no_grad():
-                out = model(x_adv)
-                f_logits = out[-1] if isinstance(out, (tuple, list)) else out
-
-            if torch.allclose(x_adv, x, atol=1e-6):
-                print(f"Warning: Adversarial samples identical to clean samples in batch {batch_idx}")
-                attack_failures += 1
-
-        except Exception as e:
-            print(f"Warning: Attack failed for batch {batch_idx}, using clean samples: {e}")
-            model.eval()
-            with torch.no_grad():
-                out = model(x)
-                f_logits = out[-1] if isinstance(out, (tuple, list)) else out
-            attack_failures += 1
-
+        
+        # 初始化对抗样本
+        x_adv = (x.detach() + 1e-3 * torch.randn_like(x)).clamp(-1, 1)
+        x_adv = torch.max(torch.min(x_adv, x + eps_t), x - eps_t)
+        
+        # PGD攻击循环
+        for step in range(perturb_steps):
+            x_adv.requires_grad_(True)
+            _, _, f_adv_logits = model(x_adv)
+            loss_adv = F.cross_entropy(f_adv_logits, y)
+            
+            # 调试输出：检查梯度状态
+            if batch_idx == 0 and step == 0:
+                print(f"Debug - x_adv.requires_grad: {x_adv.requires_grad}")
+            
+            grad = torch.autograd.grad(loss_adv, x_adv, only_inputs=True, allow_unused=True)[0]
+            if grad is None:
+                grad = torch.zeros_like(x_adv)
+                if batch_idx == 0:
+                    print("Warning: grad is None, using zeros")
+            
+            # 调试输出：检查梯度计算
+            if batch_idx == 0 and step == 0:
+                print(f"Debug - grad is None: {grad is None}")
+                print(f"Debug - grad shape: {grad.shape}")
+                print(f"Debug - grad norm: {grad.norm().item():.6f}")
+            
+            x_adv = x_adv.detach() + step_t * torch.sign(grad)
+            x_adv = torch.max(torch.min(x_adv, x + eps_t), x - eps_t)
+        
+        # 调试输出：检查攻击效果
+        if batch_idx == 0:
+            diff_mean = (x_adv - x).abs().mean().item()
+            diff_max = (x_adv - x).abs().max().item()
+            print(f"Debug - x_adv diff mean: {diff_mean:.6f}, max: {diff_max:.6f}")
+            print(f"Expected: mean ≈ 几×10⁻³, max ≈ 0.03 (8/255)")
+        
+        # 评估对抗样本
+        with torch.no_grad():
+            _, _, f_logits = model(x_adv)
+        
         correct += (f_logits.argmax(1) == y).sum().item()
         tot += y.size(0)
-
-    if attack_failures > 0:
-        print(f"Total attack failures: {attack_failures}/{len(loader)} batches")
-
+    
     return correct / max(tot, 1)
+
 
 
 
@@ -532,7 +540,11 @@ def train_fusion(model: FusionWRN, train_loader, test_loader, args, logger):
         # EMA eval
         ema.apply_to(model)
         clean = eval_clean(model, test_loader)
-        adv   = eval_adv(model, test_loader, atk_eval)
+        # 使用手动PGD评估，确保攻击确实起作用
+        adv = eval_adv_manual(model, test_loader, 
+                             getattr(args, 'attack_step', 0.01),
+                             getattr(args, 'attack_eps', 8/255),
+                             getattr(args, 'attack_iter', 20))
         ema.restore(model)
 
         logger.log(f'[WRN-Fusion-{"MART" if args.use_mart else "TRADES"}] '
