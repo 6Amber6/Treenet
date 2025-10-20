@@ -224,7 +224,7 @@ def train_adv(model, train_loader, test_loader, args, logger):
     sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs, eta_min=1e-6)
     ema = EMA(model, decay=getattr(args, 'ema_decay', 0.999))
 
-    # CE warmup
+    # CE warmup - don't apply scheduler during warmup
     warmup_epochs = min(10, args.epochs)
     for ep in range(1, warmup_epochs + 1):
         model.train()
@@ -239,7 +239,7 @@ def train_adv(model, train_loader, test_loader, args, logger):
             opt.step()
             ema.update(model)
             total_loss += loss.item(); num_batches += 1
-        sch.step()
+        # Don't step scheduler during warmup
         ema.apply_to(model)
         clean = eval_clean(model, test_loader)
         ema.restore(model)
@@ -260,6 +260,7 @@ def train_adv(model, train_loader, test_loader, args, logger):
             param_group['lr'] *= 0.1
         logger.log(f'[MART-Init] Reset BN stats and reduced LR to {opt.param_groups[0]["lr"]:.6f}')
     
+    # Start scheduler after warmup
     for ep in range(warmup_epochs + 1, args.epochs + 1):
         model.train()
         total_loss, num_batches = 0.0, 0
